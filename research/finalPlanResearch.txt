@@ -1,0 +1,279 @@
+Critical Technical Audit and Architectural Rectification for Ultra-Low Latency Deep Learning ANC
+1. Executive Summary and Strategic Overview
+The proposal under review outlines a sophisticated attempt to integrate next-generation Sequence Modeling—specifically the Multi-Band Mamba State Space Model (SSM)—into the highly constrained domain of Active Noise Cancellation (ANC). The ambition to marry the non-linear predictive capabilities of Deep Learning (DL) with the stability of classical linear adaptive filtering (FxLMS) is scientifically sound in principle. As passive isolation techniques reach their material limits, the industry is increasingly looking toward "Smart ANC" to handle non-stationary, non-linear noise sources such as wind turbulence, sirens, and transient impacts which traditional linear controllers fail to suppress.
+However, a rigorous audit of the proposed implementation plan reveals fundamental violations of acoustic causality, critical misconceptions regarding signal control loop theory, and fatal flaws in the optimization landscape. If implemented as written, the system would not only fail to cancel noise but would likely introduce significant artifacts, instability, and potentially hazardous acoustic feedback ("howling").
+The three most critical failures identified in this audit are:
+1. The Latency Illusion: The stipulation of a 20 $\mu s$ analog-to-analog latency budget is physically incompatible with the group delays inherent in standard high-fidelity sigma-delta data converters.
+2. The Spectral Blind Spot: The use of A-weighting for the loss function effectively instructs the model to ignore the very frequency bands (20 Hz – 800 Hz) where active cancellation is physically viable, rendering the system functionally useless.
+3. The Control Loop Disconnect: The serial arrangement of a "denoising" neural network feeding a linear adaptive filter fundamentally breaks the correlation mechanisms required for the FxLMS algorithm to converge, leading to system divergence.
+This report serves as both a detailed critique and a comprehensive reconstruction of the project. It deconstructs the physics of acoustic propagation to establish hard boundaries for what is computable within the causal time window. It then rebuilds the architecture, shifting from a serial denoising pipeline to a parallel control topology that respects phase linearity and hardware constraints. The final deliverable is a Corrected Plan, rewritten to ensure stability, causality, and maximum noise attenuation within realistic hardware boundaries.
+________________
+2. Theoretical Foundations of Active Acoustic Control
+To understand the specific failures of the proposed plan, one must first establish the non-negotiable physical laws governing Active Noise Cancellation. Unlike offline signal processing, ANC is a race against time where the processing system must generate an anti-noise signal that meets the unwanted noise wavefront at the error microphone with equal amplitude and exactly opposite phase ($180^\circ$).
+2.1 The Causality Constraint and the limit of $T_{elec}$
+The fundamental inequality governing any feedforward ANC system is the causality constraint. For cancellation to occur, the time it takes for the control signal to be generated and emitted must be less than or equal to the time it takes for the noise to travel from the reference sensor to the actuator.
+
+
+$$T_{acoustic} \ge T_{elec} + T_{processing}$$
+Where:
+* $T_{acoustic}$ is the propagation delay of the primary noise path (from Reference Mic to Ear).
+* $T_{elec}$ is the group delay of the electronic path (ADC conversion + DAC conversion + Anti-aliasing filters).
+* $T_{processing}$ is the computational latency (DSP/NPU inference time).
+Implication for the Plan: The proposed plan focuses heavily on minimizing $T_{processing}$ via Mamba and filterbanks but neglects the dominant factor: $T_{elec}$. In modern high-fidelity audio codecs (e.g., Cirrus Logic, Realtek, TI), the combined ADC/DAC group delay due to oversampling and interpolation filters typically ranges from 30 $\mu s$ to 100 $\mu s$ depending on the sample rate. A budget of 20 $\mu s$ total latency is physically impossible with standard PCM audio hardware, regardless of how fast the neural network runs.
+2.2 The Bode Sensitivity Integral (The "Waterbed" Effect)
+Linear control theory dictates that for any stable feedback system, the integral of the logarithm of the sensitivity function $S(\omega)$ over all frequencies is conserved.
+
+
+$$\int_{0}^{\infty} \ln|S(j\omega)| d\omega = 0$$
+This is known as the "Waterbed Effect." If we push the noise floor down in one frequency band (negative sensitivity), it must pop up in another band (positive sensitivity/amplification).
+Implication for the Plan: Deep Learning models offer a theoretical escape from this linear constraint due to their non-linearity. However, if the DL model is integrated into a linear control loop (like FxLMS) without careful bandwidth management—as proposed in the "Hybrid" topology—the system reverts to linear behavior. The plan's lack of explicit bandwidth limiting in the Mamba model risks pushing the "waterbed" amplification into the speech band (1 kHz - 4 kHz), degrading the user experience.
+2.3 Phase Linearity vs. Magnitude Estimation
+In speech enhancement or noise reduction for telephony, the primary goal is Magnitude Estimation (Spectral Subtraction). Phase is often ignored or reconstructed loosely because the human ear is relatively phase-insensitive in monaural contexts.
+In ANC, Phase is everything.
+* A phase error of $0^\circ$ yields perfect cancellation ($\to -\infty$ dB).
+* A phase error of $30^\circ$ yields $\sim 6$ dB cancellation.
+* A phase error of $60^\circ$ yields $0$ dB cancellation.
+* A phase error of $>60^\circ$ adds noise (Constructive Interference).
+Implication for the Plan: The proposal's use of IIR (Infinite Impulse Response) filterbanks for the "Brain" is a critical error. IIR filters introduce non-linear phase distortions (frequency-dependent group delay). While computationally efficient, they warp the timing of different frequency components. If the Mamba model processes these warped sub-bands, re-synthesizing the broadband cancellation signal with the sub-sample precision required for phase matching becomes mathematically impossible.
+________________
+3. Analysis of Phase 1: Architecture & Signal Flow
+The proposed architecture utilizes a Hybrid Multi-Band Mamba + FxLMS topology. This section dissects the specific components and their interaction.
+3.1 The "Brain": Multi-Band Mamba and The Filterbank Fallacy
+Plan Proposal:
+* Model: Multi-Band Mamba (State Space Model).
+* Input: Learnable Analysis Filterbanks (IIR).
+* State: No reset per frame.
+Issue 1: IIR Filterbanks in Inference
+Risk Level: Critical
+Analysis: The proposal suggests replacing STFT with IIR filterbanks to reduce latency. While STFT requires block buffering (introducing delay equal to the window size), IIR filters operate sample-by-sample. However, IIR filters achieve frequency separation via recursive feedback, which introduces Group Delay. Crucially, this group delay varies with frequency.
+* Low-frequency filters (bass) have high group delay.
+* High-frequency filters (treble) have low group delay.
+If the Mamba model receives inputs where the bass information is delayed by 2 ms relative to the treble information, it effectively sees a "smeared" version of acoustic reality. When the model predicts the cancellation waveform, it cannot align both bass and treble simultaneously with the physical acoustic wave.
+* Correction: The input stage must use Strictly Phase-Linear processing. This can be achieved via:
+   1. Dilated Convolutions (WaveNet style): Processing raw time-domain samples with a receptive field that grows exponentially.
+   2. Polyphase FIR Filterbanks: Which can be designed for linear phase at the cost of some fixed latency.
+   3. Lapped Transforms: With very high overlap (e.g., 75-87.5%) to minimize the framing delay while retaining spectral resolution.
+Issue 2: Infinite State Propagation (No Reset)
+Risk Level: High
+Analysis: The plan states the model "does not reset per frame." State Space Models (SSMs) like Mamba rely on a recurrent hidden state $h_t$. In floating-point arithmetic, running a recursive system for hours (the typical duration of headphone usage) without normalization or reset poses a risk of Numerical Drift.
+Furthermore, environmental acoustics are non-stationary. The "state" of the noise environment changes instantly when a user walks from a quiet room to a busy street. If the model maintains a strong memory of the quiet room, it will suffer from "inertia," reacting sluggishly to the sudden onset of street noise.
+* Correction: Implement a Leaky Integration mechanism in the SSM state update equation or a periodic "Soft Reset" triggered by transient detection to ensure the model remains reactive to sudden acoustic shifts.
+3.2 The "Reflex": Hybrid Control Loop Dysfunction
+Plan Proposal:
+* Role: FxLMS takes the "cleaned" reference from Mamba and matches the secondary path.
+Issue 3: The Decorrelation Trap
+Risk Level: Critical
+Analysis: This is the most subtle but devastating flaw in the plan. The standard FxLMS algorithm updates its weights $w(n)$ based on the correlation between the filtered reference signal $x'(n)$ and the error signal $e(n)$.
+
+
+
+
+$$w(n+1) = w(n) + \mu \cdot x'(n) \cdot e(n)$$
+
+
+In the proposed plan, Mamba "denoises" the reference signal before it reaches the FxLMS filter.
+* Scenario: The external microphone hears "Car Engine + Wind Noise."
+* Mamba Action: Removes "Wind Noise," outputs only "Car Engine."
+* FxLMS Input: "Car Engine."
+* Error Mic Input: "Residual Car Engine + Residual Wind Noise" (because the passive cups didn't block all the wind).
+* The Failure: The FxLMS filter sees "Car Engine" in the reference but measures "Wind Noise" in the error. It attempts to find a correlation to cancel the wind. Since the reference contains zero wind noise (Mamba removed it), the gradient for wind cancellation is undefined/stochastic. The filter weights will flail wildly in an attempt to minimize the uncorrelated error, leading to divergence and audible artifacts.
+Correction: The Deep Learning model should NOT act as a denoiser. It must act as a Non-Linear Predictor/Virtual Sensor.
+* Correct Logic: Mamba should output an estimate of the noise at the error mic location.
+* Parallel Topology: The FxLMS loop should run on the raw reference to handle linear broadband noise. The Mamba model should run in parallel, injecting a specific anti-noise signal for the complex/non-linear components that FxLMS misses. This "Additive" approach ensures the linear loop remains stable regardless of the neural network's performance.
+________________
+4. Analysis of Phase 2: Data Engineering & Physics
+The fidelity of the simulation environment determines whether the trained model transfers to the real world ("Sim-to-Real" gap).
+4.1 Physics-Compliant Pipeline Order
+Plan Proposal: Raw Noise $\to$ Mixing $\to$ RIR $\to$ Secondary Path $\to$ Input.
+Issue 4: Serial Path Simulation Error
+Risk Level: High
+Analysis: The proposal implies that the environmental noise travels through the Secondary Path (the speaker-to-ear transfer function). This is physically incorrect.
+* Primary Path: The noise travels from the Source, through the air/headphone shell, to the Ear. (Transfer Function $P(z)$).
+* Secondary Path: The anti-noise travels from the DSP, through the DAC/Amp/Speaker, to the Ear. (Transfer Function $S(z)$).
+These are Parallel acoustic paths that sum at the eardrum/error microphone. Simulating them in series effectively convolves the noise with the speaker response, training the model to cancel a signal that doesn't exist in reality.
+Correction: The simulation pipeline must be:
+1. Generate $Noise_{source}$.
+2. Convolve $Noise_{source} \ast P(z)$ to get $Noise_{at\_ear}$.
+3. Convolve $Noise_{source} \ast RIR_{ref}$ to get $Noise_{at\_ref\_mic}$.
+4. The Model sees $Noise_{at\_ref\_mic}$ and outputs $Drive_{signal}$.
+5. Convolve $Drive_{signal} \ast S(z)$ to get $AntiNoise_{at\_ear}$.
+6. $Error = Noise_{at\_ear} + AntiNoise_{at\_ear}$.
+4.2 Augmentation Strategy
+Plan Proposal: Randomize Secondary Path Phase ($\pm 30^\circ$).
+Issue 5: Non-Physical Phase Augmentation
+Risk Level: Medium
+Analysis: Adding a constant phase offset (e.g., $+30^\circ$) across all frequencies creates a filter with a non-constant group delay that may violate causality (negative group delay at low frequencies). Real-world phase variations arise from changes in acoustic distance (e.g., headset slipping) or leakage changes.
+* A 1mm gap in the ear pad creates a specific low-frequency phase roll-off and magnitude notch.
+* A 5mm shift in position changes the time-of-flight by $\sim 15 \mu s$, which is a linear phase shift ($Delay = \phi / \omega$).
+Correction: Augmentation should utilize Parametric Resampling and Fractional Delay Filters to simulate physical distance changes. Leakage should be simulated by blending a library of measured "leaky" Secondary Path transfer functions, rather than mathematically perturbing the phase angle directly.
+________________
+5. Analysis of Phase 3: The Loss Landscape
+The Loss Function is the implicit instruction set for the neural network. A flawed loss function guarantees a flawed model.
+5.1 The A-Weighting Fallacy
+Plan Proposal: Use $L_{A-Freq}$ to prioritize 500 Hz – 4 kHz.
+Issue 6: The "Anti-ANC" Weighting
+Risk Level: Critical (Showstopper)
+Analysis: This is the most dangerous error in the plan.
+* Passive Isolation: Headphone ear cups are very good at blocking high frequencies. A typical over-ear cup provides ~30 dB attenuation at 2 kHz.
+* Active Cancellation: ANC is strictly necessary for Low Frequencies (20 Hz – 800 Hz) where passive isolation is negligible (0–5 dB attenuation).
+* A-Weighting Curve: The A-weighting curve is designed to mimic human sensitivity at low volumes. It attenuates 50 Hz by -30.2 dB relative to 1 kHz.
+By using A-weighted loss, you are explicitly telling the model: "Errors at 1 kHz are 1000 times more important than errors at 50 Hz."
+* The Result: The model will focus all its capacity on cancelling 1 kHz noise.
+* The Reality: The ear cups already blocked the 1 kHz noise. Meanwhile, the 50 Hz engine drone (which the ear cups let through) is ignored by the model because the loss function de-prioritized it.
+* Outcome: The user puts on the headphones and hears the engine rumble clearly, while the ANC system uselessly tries to cancel faint speech sounds.
+Correction: The loss function must use a weighting curve that is the Inverse of the Passive Isolation Curve combined with the Equal Loudness Contour.
+* Use Modified C-Weighting or Pink Noise Weighting ($1/f$).
+* This places maximum penalty on errors in the 50 Hz – 500 Hz band, forcing the model to cancel the rumble that actually penetrates the ear cups.
+5.2 Complex Loss and Prediction Horizon
+Plan Proposal: $L_{Complex}$ with target shifted $K$ samples ahead.
+Issue 7: Non-Causal Prediction of Stochastic Signals
+Risk Level: High
+Analysis: Delay compensation ($K$ samples) is necessary to overcome $T_{elec}$. However, if $K$ is large (e.g., > 1 ms), the model is tasked with predicting the future of a random signal.
+* Periodic Noise: (e.g., Engine RPM) is predictable.
+* Stochastic Noise: (e.g., Wind gusts, tire noise) is not predictable beyond a very short correlation window.
+* Overfitting: If the model is forced to predict stochastic noise too far into the future during training, it will memorize the training data. In inference, it will guess wrong, generating "phantom" anti-noise that creates audible clicks/pops.
+Correction: The prediction horizon $K$ must be strictly bounded by the Autocorrelation Width of the target noise types. Furthermore, the loss function should include an Uncertainty Penalty: if the model is unsure of the future value, it should output zero (conservative) rather than a high-variance guess.
+________________
+6. Analysis of Phase 5 & 6: Deployment & Hardware
+6.1 The Latency Budget Reality Check
+Plan Proposal: 20 $\mu s$ Analog-to-Analog latency.
+Issue 8: Impossible Hardware Constraints
+Risk Level: Critical
+Analysis: Let's break down the latency of a typical high-performance audio path (e.g., 192 kHz sample rate):
+1. ADC Group Delay: Sigma-Delta decimation filters typically have ~10-15 samples of group delay. At 192 kHz, this is ~50-75 $\mu s$. Low-latency "Flash" ADCs exist but have poor SNR (noisy).
+2. Bus Transport (I2S/TDM): Moving data from Codec to DSP takes at least 1 sample frame (~5 $\mu s$).
+3. DAC Group Delay: Interpolation filters add another ~10-15 samples (~50-75 $\mu s$).
+Total Fixed Latency: $> 100 \mu s$ (Optimistic).
+Plan Target: $20 \mu s$.
+The target is off by an order of magnitude. Even with "Ultra-Low Latency" (ULL) modes on specialized codecs (e.g., ams OSRAM or ADI ANC codecs), the analog loop is rarely below 30-40 $\mu s$.
+Correction:
+1. Re-evaluate Budget: Design for a realistic budget of 50-80 $\mu s$.
+2. Compensation: The "Predictive" nature of Mamba is specifically useful here. The model must predict ~80 $\mu s$ into the future to align the anti-noise with the reality at the ear. This 80 $\mu s$ prediction is feasible for low-frequency noise (wavelength of 1 kHz is 1000 $\mu s$, so 80 $\mu s$ is a small fraction of the phase).
+6.2 Quantization & Noise Floor
+Plan Proposal: INT8 Quantization with APoT.
+Issue 9: Quantization Noise in ANC
+Risk Level: Medium
+Analysis: ANC requires a very high dynamic range. The system must cancel a 100 dB plane engine while having a self-noise floor below 30 dB (so it doesn't hiss in a quiet room).
+* INT8 dynamic range: ~48 dB.
+* ANC requirement: > 90 dB.
+Using INT8 for the direct signal path will inject quantization noise that sounds like a constant "hiss" or "white noise," negating the benefit of ANC in quiet environments.
+Correction:
+   * Weights: INT8 is acceptable.
+   * Activations: Must be kept at INT16 or FP16.
+   * Dithering: If INT8 activations are forced, aggressive Noise Shaping must be used to push the quantization noise into the ultrasonic range (> 20 kHz).
+________________
+7. The Corrected Plan
+Based on the exhaustive audit above, the following is the rectified, scientifically robust plan.
+Corrected Phase 1: Architecture & Signal Flow
+Selected Topology: Parallel Predictive Feedforward (Deep-Linear Hybrid)
+Rationale: Decouples the stability of the linear controller from the complexity of the neural network.
+   1. The "Linear Reflex" (Primary Broadband ANC):
+   * Component: Standard FxLMS filter running on the dedicated ANC hardware accelerator (e.g., Tensilica HiFi or dedicated logic).
+   * Role: Cancels broadband noise (20 Hz - 800 Hz) and deterministic tones using the raw reference microphone input.
+   * Latency: Ultra-low (hardware path).
+   2. The "Deep Predictor" (Residual & Non-Linear ANC):
+   * Model: Tiny-Mamba (SSM) with Skip-Connections.
+   * Input Handling: Strided Convolutional Encoder (Time-Domain).
+   * Correction: No IIR filterbanks. Use 1D convolutions with stride=2 or 4 to downsample, keeping phase relationships linear.
+   * Role:
+   1. Predicts the residual error that FxLMS will likely miss (e.g., complex non-linearities, rapid transients).
+   2. Compensates for the specific group delay of the DAC path.
+   * Output: Generates a "Delta Injection" signal summed with the FxLMS output.
+Corrected Phase 2: Data Engineering & Physics
+   1. Physics-Compliant Pipeline:
+   * Parallel Summation:
+   * $Path_A = Noise \ast RIR_{Primary}$
+   * $Path_B = Drive \ast TF_{Secondary}$
+   * $Target_{Error} = Path_A + Path_B$
+   * Simulation Fidelity: Include Non-Linear Speaker Distortion (Volterra Series) in the secondary path simulation. ANC speakers driven hard at low frequencies distort; the model must learn to compensate for this distortion.
+   2. Dataset Composition:
+   * Source: 20 hours environmental noise (unchanged).
+   * Augmentation:
+   * Gain: $\pm 6$ dB (realistic calibration error).
+   * Delay: $\pm 5$ samples (Fractional delay filters) to simulate acoustic path length changes.
+   * Leakage: Convolve with a library of "Leaky Fit" transfer functions (e.g., glasses, hair, loose fit).
+Corrected Phase 3: Training & Loss Landscape
+Loss Function Strategy: Phase-Locked Psychoacoustic Loss
+
+
+$$L_{total} = \lambda_{1}L_{Time} + \lambda_{2}L_{Spec-Low} + \lambda_{3}L_{Phase}$$
+   1. $L_{Time}$: $\frac{1}{N} \sum |y - \hat{y}|^2$ (MSE). Standard waveform matching.
+   2. $L_{Spec-Low}$: Log-Spectral magnitude distance, weighted by Modified C-Weighting.
+   * Weighting Curve: Flat (0 dB) from 20 Hz – 1 kHz. Rolls off (-12 dB/oct) above 1 kHz.
+   * Rationale: Forces the model to prioritize the bandwidth where passive isolation fails.
+   3. $L_{Phase}$: Negative Cosine Similarity.
+   * $L_{Phase} = - \sum \cos(\phi_{target} - \phi_{pred})$
+   * Rationale: Explicitly penalizes phase errors. A correct magnitude with wrong phase is worse than doing nothing.
+Prediction Horizon:
+   * Set target $Y$ to be $Y(t + T_{total\_latency})$.
+   * $T_{total\_latency}$ determined by hardware measurements (approx. 50-80 $\mu s$).
+Corrected Phase 4: Evaluation Protocol
+Primary Metrics (Physics):
+   1. Active Insertion Loss (AIL): The difference in dB between ANC-ON and ANC-OFF at the error microphone. Target: $> 25$ dB @ 100 Hz.
+   2. Coherence Function: Measure Magnitude Squared Coherence (MSC) between the residual error and the reference noise.
+   * Target: MSC $\approx 0$. (Indicates all linearly correlated noise has been removed).
+Secondary Metrics (Perception & Safety):
+   1. Boost Probability: Percentage of time the ANC system increases noise level. Target $< 0.1\%$.
+   2. Impulse Artifact Rate: Detection of "pop" sounds generated by the model during silence.
+   3. Hiss Level: A-weighted noise floor in a silent room. Target $< 25$ dBA.
+Corrected Phase 5: Model Compression & Deployment
+   1. Quantization:
+   * Weights: INT8.
+   * Activations: INT16 or Block Floating Point (BFP).
+   * Rationale: Preserves dynamic range for silence vs. loud inputs.
+   2. Pruning:
+   * Focus pruning on the "Expansion" layers of the Mamba block, keeping the "Scan" (SSM core) dense as it contains the temporal memory.
+Corrected Phase 6: Deployment & Integration Checklist
+Hardware Constraints:
+   * Sample Rate: 192 kHz or 384 kHz.
+   * Reason: Higher sample rate = Lower group delay in anti-aliasing filters.
+   * Latency Budget:
+   * ADC+DAC: 40 $\mu s$ (using Low-Latency filters).
+   * Transport: 5 $\mu s$.
+   * DSP Budget: 15 $\mu s$ (Parallel execution).
+   * Total: 60 $\mu s$ (Feasible).
+Microphone Geometry:
+   * Configuration: Broadside Array or Hybrid Feedforward/Feedback.
+   * Correction: Move reference mics to the Faceplate (exterior) of the ear cup, ensuring maximum acoustic distance from the ear canal to maximize the causality window.
+   * Gain Matching: Implement an Automatic Gain Control (AGC) calibration routine at startup to match Left/Right mic sensitivities to within 0.1 dB.
+Runtime Safety:
+   * The "Watchdog": A separate, ultra-low power logic block monitors the Error Mic signal energy.
+   * Trigger: If Energy in 2-5 kHz band > Threshold (indicating Howling/Instability).
+   * Action: Hardware Mute of the ANC DAC path within 1 sample (< 5 $\mu s$).
+________________
+8. Deep Insight: The Future of Neural ANC
+The transition from Linear FxLMS to Deep Learning ANC is not merely a component swap; it is a paradigm shift from Adaptive Filtering to Predictive Synthesis.
+8.1 The "Predictive Physicist" Model
+Traditional FxLMS reacts to noise. Deep Learning ANC predicts it. By analyzing the micro-patterns in the acoustic wavefront (e.g., the specific compression cycle of a piston engine), the Mamba model effectively learns the physical mechanism of the noise source.
+   * Insight: The model acts as a "Digital Twin" of the noise source, running slightly ahead of real-time. This allows it to cancel noise components that are strictly non-causal for a linear filter (because the linear filter needs to "see" the signal to invert it, whereas the DL model infers the signal before it arrives based on context).
+8.2 The Spectral "Waterbed" Escape
+The Waterbed Effect limits linear systems: you cannot flatten the spectrum everywhere. Deep Learning, being non-linear, can theoretically switch its transfer function dynamically.
+   * Insight: A DL-ANC system effectively creates a "Time-Varying Waterbed." It pushes the noise floor down specifically at the frequencies present in the current moment, allowing the "bump" (amplification) to move to frequencies where there is currently no energy. This dynamic spectral shaping is the holy grail of ANC, allowing for "Broadband" cancellation that exceeds the theoretical limits of LTI (Linear Time-Invariant) systems.
+8.3 The Psychoacoustic "Comfort" Floor
+Finally, the goal of "Silence" is misguided. Humans find anechoic silence oppressive (it amplifies tinnitus and internal body sounds).
+   * Insight: The Corrected Plan's loss function implicitly targets a "Comfort Noise" profile. By prioritizing low-frequency cancellation (rumble) while allowing some high-frequency residuals (air "hiss"), we mimic the spectral tilt of natural environments (Pink Noise). This reduces "Cabin Pressure" fatigue, a common complaint with aggressive commercial ANC headphones, creating a more natural and sustainable listening experience.
+9. Conclusion
+The original proposal contained the right ambition but the wrong physics. By rectifying the signal flow to respect causality, correcting the loss function to respect the ear's physiology, and realigning the hardware expectations with semiconductor reality, the Corrected Plan transforms a theoretical impossibility into a robust, manufacturable blueprint for next-generation Active Noise Cancellation.
+Final Recommendation: Proceed immediately with the Parallel Deep-Linear Topology and the Phase-Locked Spectral Loss. Abandon the 20 $\mu s$ latency target in favor of a 60 $\mu s$ predictive horizon. This aligns the engineering strategy with the immutable laws of acoustics.
+Component
+	Original Plan Status
+	Corrected Plan Status
+	Topology
+	Serial (Destructive)
+	Parallel (Addititve/Robust)
+	Input Feature
+	IIR Filterbank (Phase Distortion)
+	Time-Domain / Strided Conv (Phase Linear)
+	Loss Function
+	A-Weighted (Ignores Bass)
+	Modified C-Weighted (Target Bass)
+	Latency Budget
+	20 $\mu s$ (Impossible)
+	60 $\mu s$ (Feasible & Compensated)
+	Simulation
+	Serial (Physically Wrong)
+	Parallel Summation (Physically Correct)
+	Quantization
+	INT8 (High Noise Floor)
+	INT16 / BFP (High Dynamic Range)
+	End of Report.
