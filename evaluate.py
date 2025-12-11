@@ -11,7 +11,7 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
-import tensorflow as tf
+import torch
 from sklearn.metrics import mean_squared_error
 
 from config import (
@@ -19,20 +19,28 @@ from config import (
     STUDENT_MODEL_PATH,
     SAMPLE_RATE,
     SEQUENCE_LENGTH,
+    TEACHER_FILTERS,
+    STUDENT_FILTERS,
 )
+from models.teacher import TeacherTCN
+from models.student import StudentTCN
 from utils.audio import load_audio, play_audio
 from utils.visualization import plot_results
 
 
-def evaluate_model(model, wav_path, model_name="Model"):
+def evaluate_model(model, wav_path, model_name="Model", device=None):
     """
     Evaluate a model on a WAV file.
 
     Args:
-        model: Keras model to evaluate.
+        model: PyTorch model to evaluate.
         wav_path: Path to WAV file.
         model_name: Name for display purposes.
+        device: Torch device to use.
     """
+    if device is None:
+        device = torch.device('cpu')
+
     print(f"\n{'=' * 60}")
     print(f"Evaluating {model_name}")
     print(f"{'=' * 60}")
@@ -47,10 +55,13 @@ def evaluate_model(model, wav_path, model_name="Model"):
     for i in range(len(test_waveform) - SEQUENCE_LENGTH):
         X_test.append(test_waveform[i:i + SEQUENCE_LENGTH])
     X_test = np.array(X_test).reshape(-1, SEQUENCE_LENGTH, 1)
+    X_tensor = torch.FloatTensor(X_test).to(device)
 
     # Predict
     print("Predicting anti-phase waveform...")
-    predicted_waveform = model.predict(X_test, verbose=0).flatten()
+    model.eval()
+    with torch.no_grad():
+        predicted_waveform = model(X_tensor).cpu().numpy().flatten()
 
     # Calculate combined waveform
     combined_waveform = test_waveform[SEQUENCE_LENGTH:] + predicted_waveform
@@ -85,6 +96,37 @@ def evaluate_model(model, wav_path, model_name="Model"):
     return mse, reduction_db
 
 
+def load_model(model_path, model_type, device):
+    """
+    Load a PyTorch model from checkpoint.
+
+    Args:
+        model_path: Path to model checkpoint.
+        model_type: 'teacher' or 'student'.
+        device: Torch device to load to.
+
+    Returns:
+        Loaded model.
+    """
+    checkpoint = torch.load(model_path, map_location=device)
+
+    if model_type == 'teacher':
+        model = TeacherTCN(
+            sequence_length=checkpoint.get('sequence_length', SEQUENCE_LENGTH),
+            filters=checkpoint.get('filters', TEACHER_FILTERS)
+        )
+    else:
+        model = StudentTCN(
+            sequence_length=checkpoint.get('sequence_length', SEQUENCE_LENGTH),
+            filters=checkpoint.get('filters', STUDENT_FILTERS)
+        )
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+    return model
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate ANC models on audio files."
@@ -112,6 +154,17 @@ def main():
 
     args = parser.parse_args()
 
+    # Determine device
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        print("Using GPU (CUDA)")
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+        print("Using GPU (MPS)")
+    else:
+        device = torch.device('cpu')
+        print("Using CPU")
+
     # Check WAV file exists
     if not os.path.exists(args.wav_path):
         print(f"ERROR: WAV file not found: {args.wav_path}")
@@ -127,8 +180,8 @@ def main():
             if args.model == "teacher":
                 sys.exit(1)
         else:
-            teacher = tf.keras.models.load_model(args.teacher_path)
-            mse, db = evaluate_model(teacher, args.wav_path, "Teacher Model")
+            teacher = load_model(args.teacher_path, 'teacher', device)
+            mse, db = evaluate_model(teacher, args.wav_path, "Teacher Model", device)
             results["teacher"] = {"mse": mse, "reduction_db": db}
 
     # Evaluate student
@@ -139,8 +192,8 @@ def main():
             if args.model == "student":
                 sys.exit(1)
         else:
-            student = tf.keras.models.load_model(args.student_path)
-            mse, db = evaluate_model(student, args.wav_path, "Student Model")
+            student = load_model(args.student_path, 'student', device)
+            mse, db = evaluate_model(student, args.wav_path, "Student Model", device)
             results["student"] = {"mse": mse, "reduction_db": db}
 
     # Compare if both models evaluated
@@ -156,4 +209,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -9,10 +9,11 @@ import sys
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import tensorflow as tf
+import torch
 
-from config import TEACHER_MODEL_PATH, STUDENT_MODEL_PATH
+from config import TEACHER_MODEL_PATH, STUDENT_MODEL_PATH, SEQUENCE_LENGTH, TEACHER_FILTERS
 from data.loader import UrbanSoundLoader
+from models.teacher import TeacherTCN
 from models.student import DistilledStudentTCN
 
 
@@ -21,6 +22,14 @@ def main():
     print("Training Student Model via Knowledge Distillation")
     print("=" * 60)
 
+    # Determine device
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+
     # Load teacher model
     print(f"\nLoading teacher model from: {TEACHER_MODEL_PATH}")
     if not os.path.exists(TEACHER_MODEL_PATH):
@@ -28,7 +37,15 @@ def main():
         print("  python train_teacher.py")
         sys.exit(1)
 
-    teacher = tf.keras.models.load_model(TEACHER_MODEL_PATH)
+    # Load teacher checkpoint
+    checkpoint = torch.load(TEACHER_MODEL_PATH, map_location=device)
+    teacher = TeacherTCN(
+        sequence_length=checkpoint.get('sequence_length', SEQUENCE_LENGTH),
+        filters=checkpoint.get('filters', TEACHER_FILTERS)
+    )
+    teacher.load_state_dict(checkpoint['model_state_dict'])
+    teacher.to(device)
+    teacher.eval()
     print("Teacher model loaded successfully.")
 
     # Initialize data loader
@@ -77,4 +94,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

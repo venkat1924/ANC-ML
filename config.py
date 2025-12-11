@@ -11,8 +11,8 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data", "urbansound8k")
 MODEL_DIR = os.path.join(BASE_DIR, "saved_models")
-TEACHER_MODEL_PATH = os.path.join(MODEL_DIR, "tcn_noise_cancellation.keras")
-STUDENT_MODEL_PATH = os.path.join(MODEL_DIR, "distilled_student.keras")
+TEACHER_MODEL_PATH = os.path.join(MODEL_DIR, "tcn_noise_cancellation.pt")
+STUDENT_MODEL_PATH = os.path.join(MODEL_DIR, "distilled_student.pt")
 
 # ==============================================================================
 # Audio Parameters

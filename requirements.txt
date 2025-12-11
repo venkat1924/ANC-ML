@@ -1,7 +1,7 @@
 # ANC ML Project Dependencies
 
 # Core ML
-tensorflow>=2.10.0
+torch>=2.0.0
 numpy>=1.21.0
 scikit-learn>=1.0.0
 
@@ -16,4 +16,3 @@ IPython>=7.0.0
 
 # Utilities
 psutil>=5.8.0
-

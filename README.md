@@ -13,7 +13,7 @@ A machine learning approach to Active Noise Cancellation (ANC) using Temporal Co
 7. [Configuration Reference](#configuration-reference)
 8. [Project Structure](#project-structure)
 9. [Model Details](#model-details)
-10. [Troubleshooting](#troubleshooting)
+10. [References](#references)
 
 ---
 
@@ -72,43 +72,65 @@ TCNs are chosen for this task because:
 
 3. **Parallelizable**: Unlike RNNs, convolutions can be computed in parallel during training.
 
+### Causal Padding in PyTorch
+
+PyTorch does not have built-in causal padding like Keras. The implementation pads only the left side:
+
+```python
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation)
+
+    def forward(self, x):
+        x = F.pad(x, (self.padding, 0))  # Pad left only
+        return self.conv(x)
+```
+
 ### Teacher Model Architecture
 
 ```
-Input (50, 1)
+Input (batch, 50, 1)
     │
     ▼
-Conv1D(64 filters, kernel=3, dilation=1, causal) + BatchNorm + ReLU
+Permute to (batch, 1, 50)
     │
     ▼
-Conv1D(64 filters, kernel=3, dilation=2, causal) + BatchNorm + ReLU
+CausalConv1D(64 filters, kernel=3, dilation=1) + BatchNorm1D + ReLU
     │
     ▼
-Conv1D(64 filters, kernel=3, dilation=4, causal) + BatchNorm + ReLU
+CausalConv1D(64 filters, kernel=3, dilation=2) + BatchNorm1D + ReLU
+    │
+    ▼
+CausalConv1D(64 filters, kernel=3, dilation=4) + BatchNorm1D + ReLU
     │
     ▼
 Flatten
     │
     ▼
-Dense(1) → Output (predicted anti-phase sample)
+Linear(1) → Output (predicted anti-phase sample)
 ```
 
 ### Student Model Architecture (Distilled)
 
 ```
-Input (50, 1)
+Input (batch, 50, 1)
     │
     ▼
-Conv1D(32 filters, kernel=3, dilation=1, causal) + BatchNorm + ReLU
+Permute to (batch, 1, 50)
     │
     ▼
-Conv1D(32 filters, kernel=3, dilation=2, causal) + BatchNorm + ReLU
+CausalConv1D(32 filters, kernel=3, dilation=1) + BatchNorm1D + ReLU
+    │
+    ▼
+CausalConv1D(32 filters, kernel=3, dilation=2) + BatchNorm1D + ReLU
     │
     ▼
 Flatten
     │
     ▼
-Dense(1) → Output (predicted anti-phase sample)
+Linear(1) → Output (predicted anti-phase sample)
 ```
 
 The student has ~50% fewer parameters: 2 layers instead of 3, 32 filters instead of 64.
@@ -134,9 +156,9 @@ This allows the smaller student to learn from both the true signal and the teach
 ### Requirements
 
 - Python 3.8+
-- TensorFlow 2.10+
+- PyTorch 2.0+
 - 4GB+ RAM recommended
-- GPU optional but recommended for training
+- GPU optional but recommended for training (CUDA or MPS)
 
 ### Setup
 
@@ -157,7 +179,7 @@ pip install -r requirements.txt
 
 | Package | Purpose |
 |---------|---------|
-| tensorflow | Neural network framework |
+| torch | Neural network framework |
 | numpy | Numerical operations |
 | librosa | Audio loading and processing |
 | soundata | UrbanSound8K dataset management |
@@ -233,7 +255,7 @@ This will:
 - Build the teacher TCN model
 - Train on randomly selected audio clips
 - Evaluate on a test waveform
-- Save the model to `saved_models/tcn_noise_cancellation.keras`
+- Save the model to `saved_models/tcn_noise_cancellation.pt`
 
 ### 2. Train the Student Model (Knowledge Distillation)
 
@@ -247,7 +269,7 @@ This will:
 - Load the trained teacher model
 - Build the compact student model
 - Train via distillation (learning from both ground truth and teacher)
-- Save to `saved_models/distilled_student.keras`
+- Save to `saved_models/distilled_student.pt`
 
 ### 3. Evaluate on Audio Files
 
@@ -296,12 +318,24 @@ model.save_model()
 ```
 
 ```python
-import tensorflow as tf
+import torch
+from models.teacher import TeacherTCN
 from models.student import DistilledStudentTCN
 from data.loader import UrbanSoundLoader
+from config import TEACHER_MODEL_PATH, SEQUENCE_LENGTH, TEACHER_FILTERS
+
+# Determine device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Load teacher
-teacher = tf.keras.models.load_model("saved_models/tcn_noise_cancellation.keras")
+checkpoint = torch.load(TEACHER_MODEL_PATH, map_location=device)
+teacher = TeacherTCN(
+    sequence_length=checkpoint.get('sequence_length', SEQUENCE_LENGTH),
+    filters=checkpoint.get('filters', TEACHER_FILTERS)
+)
+teacher.load_state_dict(checkpoint['model_state_dict'])
+teacher.to(device)
+teacher.eval()
 
 # Create and train student
 loader = UrbanSoundLoader()
@@ -323,8 +357,8 @@ All configurable parameters are in `config.py`. Modify these to experiment with 
 | `BASE_DIR` | Project root | Base directory for relative paths |
 | `DATA_DIR` | `data/urbansound8k` | Dataset location |
 | `MODEL_DIR` | `saved_models/` | Directory for saved models |
-| `TEACHER_MODEL_PATH` | `saved_models/tcn_noise_cancellation.keras` | Teacher model save path |
-| `STUDENT_MODEL_PATH` | `saved_models/distilled_student.keras` | Student model save path |
+| `TEACHER_MODEL_PATH` | `saved_models/tcn_noise_cancellation.pt` | Teacher model save path |
+| `STUDENT_MODEL_PATH` | `saved_models/distilled_student.pt` | Student model save path |
 
 ### Audio Parameters
 
@@ -387,8 +421,8 @@ ANC/
 │   └── loader.py             # UrbanSoundLoader class
 ├── models/
 │   ├── __init__.py
-│   ├── teacher.py            # WaveformPredictorTCN, build_teacher_model()
-│   └── student.py            # DistilledStudentTCN, build_student_model()
+│   ├── teacher.py            # TeacherTCN, WaveformPredictorTCN, CausalConv1d
+│   └── student.py            # StudentTCN, DistilledStudentTCN
 ├── utils/
 │   ├── __init__.py
 │   ├── audio.py              # load_audio(), normalize_audio(), play_audio()
@@ -398,8 +432,8 @@ ANC/
 ├── evaluate.py               # Model evaluation CLI
 ├── requirements.txt          # Python dependencies
 ├── saved_models/             # Created on first model save
-│   ├── tcn_noise_cancellation.keras
-│   └── distilled_student.keras
+│   ├── tcn_noise_cancellation.pt
+│   └── distilled_student.pt
 └── README.md                 # This file
 ```
 
@@ -415,20 +449,23 @@ ANC/
 
 #### `models/teacher.py`
 
-- `build_teacher_model()`: Construct the 3-layer TCN architecture
-- `WaveformPredictorTCN`: Full training/inference class
-  - `train()`: Train on prepared sequences
+- `CausalConv1d`: Custom causal convolution layer (left-padding only)
+- `TeacherTCN`: PyTorch nn.Module with 3-layer TCN architecture
+- `build_teacher_model()`: Construct the TeacherTCN model
+- `WaveformPredictorTCN`: Full training/inference wrapper class
+  - `train()`: Train on prepared sequences with early stopping
   - `predict()`: Generate anti-phase predictions
   - `test_with_wav()`: Full evaluation pipeline for a WAV file
-  - `save_model()`, `load_model()`: Model persistence
+  - `save_model()`, `load_model()`: Model persistence via torch.save/load
 
 #### `models/student.py`
 
-- `build_student_model()`: Construct the compact 2-layer TCN
-- `DistilledStudentTCN`: Distillation training class
-  - `_prepare_batch()`: Generator yielding (input, [ground_truth, teacher_pred])
+- `StudentTCN`: PyTorch nn.Module with compact 2-layer TCN
+- `build_student_model()`: Construct the StudentTCN model
+- `DistilledStudentTCN`: Distillation training wrapper class
+  - `_generate_batch()`: Generate batches with teacher predictions
   - `_distillation_loss()`: Combined loss function
-  - `train()`: Distillation training loop
+  - `train()`: Distillation training loop with early stopping
   - `predict()`, `test_with_wav()`: Same interface as teacher
 
 #### `utils/audio.py`
@@ -449,8 +486,8 @@ ANC/
 
 | Model | Layers | Filters | Approximate Parameters |
 |-------|--------|---------|------------------------|
-| Teacher | 3 Conv1D + Dense | 64 | ~220K |
-| Student | 2 Conv1D + Dense | 32 | ~55K |
+| Teacher | 3 CausalConv1D + Linear | 64 | ~220K |
+| Student | 2 CausalConv1D + Linear | 32 | ~55K |
 
 ### Receptive Field
 
@@ -466,6 +503,13 @@ At 16kHz sample rate:
 - For real-time ANC, the model must predict faster than 62.5μs per sample
 - The student model's smaller size makes it more suitable for real-time edge deployment
 
+### Device Support
+
+The implementation automatically detects and uses:
+- **CUDA**: NVIDIA GPUs
+- **MPS**: Apple Silicon (M1/M2/M3)
+- **CPU**: Fallback for all systems
+
 ### Loss Function
 
 - **Teacher**: Standard MSE between predicted and inverted ground truth
@@ -474,6 +518,18 @@ At 16kHz sample rate:
   L = 0.7 × MSE(pred, -ground_truth) + 0.3 × MSE(pred, teacher_pred)
   ```
 
+### Model Checkpoint Format
+
+Models are saved as PyTorch state dictionaries with metadata:
+
+```python
+{
+    'model_state_dict': model.state_dict(),
+    'sequence_length': 50,
+    'filters': 64  # or 32 for student
+}
+```
+
 ---
 
 ## References
@@ -481,4 +537,3 @@ At 16kHz sample rate:
 - UrbanSound8K Dataset: J. Salamon, C. Jacoby and J. P. Bello, "A Dataset and Taxonomy for Urban Sound Research", ACM Multimedia 2014
 - Temporal Convolutional Networks: Bai, S., Kolter, J. Z., & Koltun, V. (2018). "An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling"
 - Knowledge Distillation: Hinton, G., Vinyals, O., & Dean, J. (2015). "Distilling the Knowledge in a Neural Network"
-
