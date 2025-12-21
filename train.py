@@ -1,77 +1,50 @@
+#!/usr/bin/env python3
 """
-Training Script for Deep ANC TinyMamba Model.
+Training script for TinyMamba ANC model.
 
-Trains the neural network component of the hybrid ANC system.
-Uses delay-compensated targets and composite loss function.
+Trains the neural predictor using DNS Challenge noise data
+with delay compensation and composite loss function.
 
 Usage:
-    python train.py --data_dir ./data/raw --epochs 50 --batch_size 16
+    python train.py --data_dir ./data/raw --epochs 50
+    python train.py --synthetic --epochs 20  # Use synthetic data
 """
 
 import argparse
 import os
+from pathlib import Path
 from datetime import datetime
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
-from src.dataset import ANCDataset
-from src.mamba_anc import TinyMambaANC
+from src.mamba_anc import TinyMambaANC, create_model
+from src.dataset import DNSDataset, SyntheticNoiseDataset
 from src.loss import CompositeLoss
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train TinyMamba ANC model")
-    parser.add_argument("--data_dir", type=str, default="./data/raw",
-                        help="Directory containing training audio files")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints",
-                        help="Directory to save model checkpoints")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=16,
-                        help="Batch size for training")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Learning rate")
-    parser.add_argument("--sample_rate", type=int, default=48000,
-                        help="Audio sample rate")
-    parser.add_argument("--chunk_size", type=int, default=16384,
-                        help="Audio chunk size in samples")
-    parser.add_argument("--delay_k", type=int, default=3,
-                        help="Delay compensation K samples (~60µs at 48kHz)")
-    parser.add_argument("--d_model", type=int, default=32,
-                        help="Model hidden dimension")
-    parser.add_argument("--n_layers", type=int, default=2,
-                        help="Number of Mamba layers")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume from")
-    parser.add_argument("--no_augment", action="store_true",
-                        help="Disable data augmentation")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Device (cuda, cpu, or auto)")
-    return parser.parse_args()
 
 
 def train_epoch(
     model: nn.Module,
-    loader: DataLoader,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
-    optimizer: optim.Optimizer,
     device: torch.device,
     epoch: int
 ) -> dict:
     """Train for one epoch."""
     model.train()
     
-    total_loss = 0
-    total_time = 0
-    total_spec = 0
-    total_phase = 0
+    total_loss = 0.0
+    component_sums = {"time": 0, "spectral": 0, "phase": 0, "uncertainty": 0}
     n_batches = 0
     
-    pbar = tqdm(loader, desc=f"Epoch {epoch}")
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    
     for batch_idx, (inputs, targets) in enumerate(pbar):
         inputs = inputs.to(device)
         targets = targets.to(device)
@@ -81,76 +54,182 @@ def train_epoch(
         # Forward pass
         outputs = model(inputs)
         
-        # Handle shape mismatch from strided conv
+        # Match target length if needed
         min_len = min(outputs.shape[-1], targets.shape[-1])
-        outputs = outputs[:, :, :min_len]
-        targets = targets[:, :, :min_len]
+        outputs = outputs[..., :min_len]
+        targets = targets[..., :min_len]
         
         # Compute loss
-        loss, components = criterion(outputs, targets, input_signal=inputs[:, :, :min_len])
+        loss, components = criterion(outputs, targets, input_signal=inputs)
         
         # Backward pass
         loss.backward()
         
-        # Gradient clipping for stability
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
         
         # Accumulate metrics
-        total_loss += components["total"]
-        total_time += components["time"]
-        total_spec += components["spectral"]
-        total_phase += components["phase"]
+        total_loss += loss.item()
+        for k, v in components.items():
+            if k in component_sums:
+                component_sums[k] += v
         n_batches += 1
         
         # Update progress bar
         pbar.set_postfix({
-            "loss": f"{components['total']:.4f}",
+            "loss": f"{loss.item():.4f}",
             "time": f"{components['time']:.4f}",
             "phase": f"{components['phase']:.4f}"
         })
     
-    return {
-        "loss": total_loss / n_batches,
-        "time": total_time / n_batches,
-        "spectral": total_spec / n_batches,
-        "phase": total_phase / n_batches
-    }
+    # Average metrics
+    avg_loss = total_loss / n_batches
+    avg_components = {k: v / n_batches for k, v in component_sums.items()}
+    
+    return {"loss": avg_loss, **avg_components}
 
 
 def validate(
     model: nn.Module,
-    loader: DataLoader,
+    dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device
 ) -> dict:
-    """Validate model."""
+    """Validate the model."""
     model.eval()
     
-    total_loss = 0
+    total_loss = 0.0
+    component_sums = {"time": 0, "spectral": 0, "phase": 0, "uncertainty": 0}
     n_batches = 0
     
     with torch.no_grad():
-        for inputs, targets in loader:
+        for inputs, targets in dataloader:
             inputs = inputs.to(device)
             targets = targets.to(device)
             
             outputs = model(inputs)
             
             min_len = min(outputs.shape[-1], targets.shape[-1])
-            outputs = outputs[:, :, :min_len]
-            targets = targets[:, :, :min_len]
+            outputs = outputs[..., :min_len]
+            targets = targets[..., :min_len]
             
             loss, components = criterion(outputs, targets)
-            total_loss += components["total"]
+            
+            total_loss += loss.item()
+            for k, v in components.items():
+                if k in component_sums:
+                    component_sums[k] += v
             n_batches += 1
     
-    return {"loss": total_loss / n_batches}
+    avg_loss = total_loss / max(n_batches, 1)
+    avg_components = {k: v / max(n_batches, 1) for k, v in component_sums.items()}
+    
+    return {"loss": avg_loss, **avg_components}
+
+
+def plot_training_curves(history: dict, save_path: Path):
+    """Plot and save training curves."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    epochs = range(1, len(history["train_loss"]) + 1)
+    
+    # Total loss
+    axes[0, 0].plot(epochs, history["train_loss"], label="Train")
+    axes[0, 0].plot(epochs, history["val_loss"], label="Val")
+    axes[0, 0].set_xlabel("Epoch")
+    axes[0, 0].set_ylabel("Loss")
+    axes[0, 0].set_title("Total Loss")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+    
+    # Time loss
+    axes[0, 1].plot(epochs, history["train_time"], label="Train")
+    axes[0, 1].plot(epochs, history["val_time"], label="Val")
+    axes[0, 1].set_xlabel("Epoch")
+    axes[0, 1].set_ylabel("Loss")
+    axes[0, 1].set_title("Time-Domain MSE")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+    
+    # Phase loss
+    axes[1, 0].plot(epochs, history["train_phase"], label="Train")
+    axes[1, 0].plot(epochs, history["val_phase"], label="Val")
+    axes[1, 0].set_xlabel("Epoch")
+    axes[1, 0].set_ylabel("Loss")
+    axes[1, 0].set_title("Phase Cosine Loss")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+    
+    # Spectral loss
+    axes[1, 1].plot(epochs, history["train_spectral"], label="Train")
+    axes[1, 1].plot(epochs, history["val_spectral"], label="Val")
+    axes[1, 1].set_xlabel("Epoch")
+    axes[1, 1].set_ylabel("Loss")
+    axes[1, 1].set_title("C-Weighted Spectral Loss")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"Training curves saved to {save_path}")
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Train TinyMamba ANC model")
+    
+    # Data arguments
+    parser.add_argument("--data_dir", type=str, default="./data/raw",
+                        help="Path to training data")
+    parser.add_argument("--synthetic", action="store_true",
+                        help="Use synthetic data instead of real audio")
+    parser.add_argument("--max_files", type=int, default=None,
+                        help="Maximum files to load (for testing)")
+    
+    # Model arguments
+    parser.add_argument("--model_size", type=str, default="tiny",
+                        choices=["tiny", "small", "medium"],
+                        help="Model size preset")
+    parser.add_argument("--d_model", type=int, default=None,
+                        help="Override model dimension")
+    parser.add_argument("--n_layers", type=int, default=None,
+                        help="Override number of layers")
+    
+    # Training arguments
+    parser.add_argument("--epochs", type=int, default=50,
+                        help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate")
+    parser.add_argument("--chunk_length", type=int, default=16384,
+                        help="Audio chunk length in samples")
+    parser.add_argument("--K", type=int, default=3,
+                        help="Delay compensation in samples")
+    parser.add_argument("--fs", type=int, default=48000,
+                        help="Sample rate")
+    
+    # Loss weights
+    parser.add_argument("--lambda_time", type=float, default=1.0)
+    parser.add_argument("--lambda_spec", type=float, default=0.5)
+    parser.add_argument("--lambda_phase", type=float, default=0.5)
+    parser.add_argument("--lambda_uncertainty", type=float, default=0.1)
+    
+    # Output arguments
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints",
+                        help="Directory for saving checkpoints")
+    parser.add_argument("--save_every", type=int, default=10,
+                        help="Save checkpoint every N epochs")
+    
+    # Hardware
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device: 'cuda', 'cpu', or 'auto'")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader workers")
+    
+    args = parser.parse_args()
     
     # Setup device
     if args.device == "auto":
@@ -159,31 +238,68 @@ def main():
         device = torch.device(args.device)
     print(f"Using device: {device}")
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Create checkpoint directory
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create dataset
-    print(f"Loading dataset from {args.data_dir}")
-    dataset = ANCDataset(
-        root_dir=args.data_dir,
-        sample_rate=args.sample_rate,
-        chunk_size=args.chunk_size,
-        delay_compensation=args.delay_k,
-        augment=not args.no_augment
-    )
+    # Create datasets
+    print("\nLoading datasets...")
+    if args.synthetic:
+        print("Using synthetic noise data")
+        train_dataset = SyntheticNoiseDataset(
+            n_samples=2000,
+            chunk_length=args.chunk_length,
+            K=args.K,
+            fs=args.fs
+        )
+        val_dataset = SyntheticNoiseDataset(
+            n_samples=500,
+            chunk_length=args.chunk_length,
+            K=args.K,
+            fs=args.fs,
+            seed=42
+        )
+    else:
+        data_dir = Path(args.data_dir)
+        
+        # Find subdirectories with audio
+        subdirs = [d for d in data_dir.iterdir() if d.is_dir()]
+        if subdirs:
+            # Use all subdirectories
+            all_files = []
+            for subdir in subdirs:
+                all_files.extend(list(subdir.rglob("*.wav")))
+            print(f"Found {len(all_files)} audio files in {len(subdirs)} subdirectories")
+        
+        train_dataset = DNSDataset(
+            data_dir=args.data_dir,
+            chunk_length=args.chunk_length,
+            K=args.K,
+            fs=args.fs,
+            augment=True,
+            max_files=args.max_files
+        )
+        
+        # Use a portion for validation (no augmentation)
+        val_dataset = DNSDataset(
+            data_dir=args.data_dir,
+            chunk_length=args.chunk_length,
+            K=args.K,
+            fs=args.fs,
+            augment=False,
+            max_files=args.max_files // 5 if args.max_files else None,
+            seed=42
+        )
     
-    # Split into train/val
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size]
-    )
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Val samples: {len(val_dataset)}")
     
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,  # Set to 0 for debugging, increase for production
+        num_workers=args.num_workers,
         pin_memory=True if device.type == "cuda" else False
     )
     
@@ -191,60 +307,56 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0
+        num_workers=args.num_workers,
+        pin_memory=True if device.type == "cuda" else False
     )
-    
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
     # Create model
-    model = TinyMambaANC(
-        d_model=args.d_model,
-        d_state=16,
-        n_layers=args.n_layers,
-        d_conv=4,
-        expand=1
-    ).to(device)
+    print("\nCreating model...")
+    model_kwargs = {}
+    if args.d_model is not None:
+        model_kwargs["d_model"] = args.d_model
+    if args.n_layers is not None:
+        model_kwargs["n_layers"] = args.n_layers
     
-    print(f"Model parameters: {model.get_num_params():,}")
+    model = create_model(args.model_size, **model_kwargs)
+    model = model.to(device)
     
-    # Loss function (composite: time + C-weighted spectral + phase)
+    n_params = model.get_num_params()
+    print(f"Model: TinyMamba ({args.model_size})")
+    print(f"Parameters: {n_params:,}")
+    
+    # Create loss function
     criterion = CompositeLoss(
-        fs=args.sample_rate,
-        lambda_time=1.0,
-        lambda_spec=0.5,
-        lambda_phase=0.5,
-        lambda_uncertainty=0.1
+        fs=args.fs,
+        lambda_time=args.lambda_time,
+        lambda_spec=args.lambda_spec,
+        lambda_phase=args.lambda_phase,
+        lambda_uncertainty=args.lambda_uncertainty
     )
     
-    # Optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    # Create optimizer and scheduler
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
-    )
+    # Training history
+    history = {
+        "train_loss": [], "val_loss": [],
+        "train_time": [], "val_time": [],
+        "train_phase": [], "val_phase": [],
+        "train_spectral": [], "val_spectral": []
+    }
     
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    best_loss = float("inf")
-    
-    if args.resume:
-        print(f"Resuming from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        best_loss = checkpoint.get("best_loss", float("inf"))
+    best_val_loss = float("inf")
     
     # Training loop
     print(f"\nStarting training for {args.epochs} epochs...")
-    print(f"Delay compensation K={args.delay_k} samples (~{args.delay_k * 1e6 / args.sample_rate:.1f}µs)")
-    print("-" * 60)
+    print("=" * 60)
     
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(1, args.epochs + 1):
         # Train
         train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch + 1
+            model, train_loader, optimizer, criterion, device, epoch
         )
         
         # Validate
@@ -253,40 +365,65 @@ def main():
         # Update scheduler
         scheduler.step()
         
-        # Print metrics
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
-        print(f"  Train - Loss: {train_metrics['loss']:.4f}, "
-              f"Time: {train_metrics['time']:.4f}, "
-              f"Spec: {train_metrics['spectral']:.4f}, "
-              f"Phase: {train_metrics['phase']:.4f}")
-        print(f"  Val   - Loss: {val_metrics['loss']:.4f}")
-        print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+        # Record history
+        history["train_loss"].append(train_metrics["loss"])
+        history["val_loss"].append(val_metrics["loss"])
+        history["train_time"].append(train_metrics["time"])
+        history["val_time"].append(val_metrics["time"])
+        history["train_phase"].append(train_metrics["phase"])
+        history["val_phase"].append(val_metrics["phase"])
+        history["train_spectral"].append(train_metrics["spectral"])
+        history["val_spectral"].append(val_metrics["spectral"])
         
-        # Save checkpoint
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "train_loss": train_metrics["loss"],
-            "val_loss": val_metrics["loss"],
-            "best_loss": best_loss,
-            "args": vars(args)
-        }
+        # Print epoch summary
+        print(f"\nEpoch {epoch}/{args.epochs}")
+        print(f"  Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
+        print(f"  Train Phase: {train_metrics['phase']:.4f} | Val Phase: {val_metrics['phase']:.4f}")
+        print(f"  LR: {scheduler.get_last_lr()[0]:.2e}")
         
-        # Save latest
-        torch.save(checkpoint, os.path.join(args.output_dir, "mamba_anc_latest.pth"))
+        # Save best model
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            best_path = checkpoint_dir / "mamba_anc_best.pth"
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": best_val_loss,
+                "args": vars(args)
+            }, best_path)
+            print(f"  Saved best model (val_loss: {best_val_loss:.4f})")
         
-        # Save best
-        if val_metrics["loss"] < best_loss:
-            best_loss = val_metrics["loss"]
-            checkpoint["best_loss"] = best_loss
-            torch.save(checkpoint, os.path.join(args.output_dir, "mamba_anc_best.pth"))
-            print(f"  -> New best model saved (loss: {best_loss:.4f})")
+        # Save periodic checkpoint
+        if epoch % args.save_every == 0:
+            ckpt_path = checkpoint_dir / f"mamba_anc_epoch{epoch}.pth"
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_metrics["loss"],
+                "args": vars(args)
+            }, ckpt_path)
+            print(f"  Saved checkpoint: {ckpt_path}")
+    
+    # Save final model
+    final_path = checkpoint_dir / "mamba_anc_final.pth"
+    torch.save({
+        "epoch": args.epochs,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_loss": val_metrics["loss"],
+        "args": vars(args)
+    }, final_path)
+    print(f"\nSaved final model: {final_path}")
+    
+    # Plot training curves
+    plot_training_curves(history, checkpoint_dir / "training_curves.png")
     
     print("\n" + "=" * 60)
     print("Training complete!")
-    print(f"Best validation loss: {best_loss:.4f}")
-    print(f"Model saved to {args.output_dir}/mamba_anc_best.pth")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Checkpoints saved to: {checkpoint_dir}")
 
 
 if __name__ == "__main__":

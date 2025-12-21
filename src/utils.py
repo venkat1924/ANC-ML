@@ -1,24 +1,17 @@
 """
 Core utilities for Deep ANC system.
 
-Includes safety limiters, watchdog monitoring, signal processing helpers,
-and psychoacoustic weighting curves.
+Functions:
+- soft_clip: Tanh-based limiter preventing amplifier clipping
+- watchdog_check: Anti-howling monitor for 2-5kHz instability
+- fractional_delay: Sinc interpolation for sub-sample delays
+- modified_c_weight: Bass-priority weighting for ANC loss
 """
 
 import numpy as np
 import torch
-import scipy.signal as signal
+from scipy import signal
 from typing import Union, Tuple
-
-
-def db_to_linear(db: float) -> float:
-    """Convert decibels to linear amplitude."""
-    return 10 ** (db / 20)
-
-
-def linear_to_db(linear: float, eps: float = 1e-10) -> float:
-    """Convert linear amplitude to decibels."""
-    return 20 * np.log10(np.maximum(linear, eps))
 
 
 def soft_clip(x: Union[np.ndarray, torch.Tensor], threshold: float = 0.95) -> Union[np.ndarray, torch.Tensor]:
@@ -30,7 +23,7 @@ def soft_clip(x: Union[np.ndarray, torch.Tensor], threshold: float = 0.95) -> Un
     
     Args:
         x: Input signal (numpy array or torch tensor)
-        threshold: Maximum output amplitude (0-1)
+        threshold: Soft clipping threshold (0-1 range normalized)
     
     Returns:
         Soft-clipped signal with same type as input
@@ -50,97 +43,86 @@ def watchdog_check(
     """
     Anti-howling watchdog: Monitor 2-5kHz energy for instability.
     
-    Howling/feedback typically manifests as high energy in the 2-5kHz band.
-    If sustained high energy is detected, system should bypass to prevent damage.
+    If sustained high energy is detected in the 2-5kHz band,
+    the system should bypass ANC to prevent speaker/ear damage.
     
     Args:
-        error_buffer: Recent error signal samples (at least sustained_samples long)
-        fs: Sample rate in Hz
+        error_buffer: Recent error signal samples
+        fs: Sample rate
         threshold_db: Energy threshold in dB (relative to full scale)
-        sustained_samples: Number of consecutive samples above threshold to trigger
+        sustained_samples: Number of samples above threshold to trigger
     
     Returns:
-        Tuple of (triggered: bool, current_energy_db: float)
+        triggered: True if watchdog should activate bypass
+        energy_db: Current energy level in dB
     """
-    # Design bandpass filter for 2-5kHz
-    nyq = fs / 2
-    low = 2000 / nyq
-    high = min(5000 / nyq, 0.99)  # Ensure we don't exceed Nyquist
-    
-    if low >= high:
-        # Sample rate too low for this band
+    if len(error_buffer) < 256:
         return False, -100.0
     
+    # Design bandpass filter for 2-5kHz (howling detection band)
+    nyq = fs / 2
+    low = 2000 / nyq
+    high = min(5000 / nyq, 0.99)
+    
     try:
-        sos = signal.butter(4, [low, high], btype='band', output='sos')
-        filtered = signal.sosfilt(sos, error_buffer)
+        b, a = signal.butter(4, [low, high], btype='band')
+        filtered = signal.lfilter(b, a, error_buffer)
     except ValueError:
         return False, -100.0
     
     # Calculate energy in dB
-    energy = np.mean(filtered ** 2)
+    energy = np.mean(filtered[-sustained_samples:] ** 2)
     energy_db = 10 * np.log10(energy + 1e-10)
     
-    threshold_linear = db_to_linear(threshold_db) ** 2
-    
-    # Check if energy exceeds threshold
-    triggered = energy > threshold_linear
+    # Check if sustained high energy
+    triggered = energy_db > threshold_db
     
     return triggered, energy_db
 
 
-def fractional_delay(
-    signal_in: np.ndarray,
-    delay_samples: float,
-    filter_length: int = 31
-) -> np.ndarray:
+def fractional_delay(sig: np.ndarray, delay_samples: float) -> np.ndarray:
     """
-    Apply fractional sample delay using windowed sinc interpolation.
+    Apply fractional sample delay using sinc interpolation.
     
-    Physics-accurate sub-sample delay for simulating acoustic path
-    length changes without phase distortion artifacts.
+    Used for physics-based augmentation to simulate small
+    distance changes (sub-sample precision).
     
     Args:
-        signal_in: Input signal
+        sig: Input signal
         delay_samples: Delay in samples (can be fractional)
-        filter_length: Length of sinc filter (odd number, longer = more accurate)
     
     Returns:
-        Delayed signal (same length as input)
+        Delayed signal (same length, zero-padded)
     """
     if abs(delay_samples) < 1e-6:
-        return signal_in.copy()
+        return sig.copy()
     
-    # Ensure odd filter length
-    if filter_length % 2 == 0:
-        filter_length += 1
+    n_taps = 31  # Sinc interpolation filter length
+    half_taps = n_taps // 2
     
-    # Create sinc filter centered at fractional delay
-    half_len = filter_length // 2
-    n = np.arange(-half_len, half_len + 1)
+    # Create sinc kernel with Hamming window
+    n = np.arange(n_taps) - half_taps
     
-    # Fractional part of delay
+    # Sinc function centered at fractional delay
     frac_delay = delay_samples - int(delay_samples)
+    sinc_kernel = np.sinc(n - frac_delay)
+    
+    # Apply Hamming window
+    window = np.hamming(n_taps)
+    kernel = sinc_kernel * window
+    kernel /= np.sum(kernel)  # Normalize
+    
+    # Apply integer delay by padding
     int_delay = int(delay_samples)
-    
-    # Windowed sinc filter
-    sinc_filter = np.sinc(n - frac_delay)
-    
-    # Apply Hann window to reduce ringing
-    window = np.hanning(filter_length)
-    sinc_filter = sinc_filter * window
-    sinc_filter = sinc_filter / np.sum(sinc_filter)  # Normalize
+    if int_delay > 0:
+        sig_padded = np.concatenate([np.zeros(int_delay), sig[:-int_delay]])
+    elif int_delay < 0:
+        sig_padded = np.concatenate([sig[-int_delay:], np.zeros(-int_delay)])
+    else:
+        sig_padded = sig.copy()
     
     # Apply fractional delay via convolution
-    delayed = signal.convolve(signal_in, sinc_filter, mode='same')
-    
-    # Apply integer delay via shifting
-    if int_delay > 0:
-        delayed = np.pad(delayed, (int_delay, 0))[:len(signal_in)]
-    elif int_delay < 0:
-        delayed = np.pad(delayed, (0, -int_delay))[-int_delay:]
-        if len(delayed) < len(signal_in):
-            delayed = np.pad(delayed, (0, len(signal_in) - len(delayed)))
+    delayed = np.convolve(sig_padded, kernel, mode='same')
     
     return delayed
 
@@ -153,106 +135,132 @@ def modified_c_weight(freqs: Union[np.ndarray, torch.Tensor], fs: int = 48000) -
     This prioritizes bass frequencies where passive isolation fails
     and ANC is most needed.
     
+    Why not A-weighting? A-weighting de-emphasizes low frequencies
+    where ANC is most effective. C-weighting keeps bass priority.
+    
     Args:
-        freqs: Frequency values in Hz
-        fs: Sample rate (for normalization context)
+        freqs: Frequency array in Hz
+        fs: Sample rate (for normalization)
     
     Returns:
-        Weighting values (linear scale, not dB)
+        Weight array (linear scale, same shape as freqs)
     """
-    if isinstance(freqs, torch.Tensor):
-        weights = torch.ones_like(freqs)
-        # -12dB/oct above 1kHz = multiply by (1000/f)^2
-        high_freq_mask = freqs > 1000
-        weights[high_freq_mask] = (1000.0 / freqs[high_freq_mask]) ** 2
-        # Zero out DC and very low frequencies
-        weights[freqs < 20] = 0.0
-    else:
-        weights = np.ones_like(freqs)
-        high_freq_mask = freqs > 1000
-        weights[high_freq_mask] = (1000.0 / freqs[high_freq_mask]) ** 2
-        weights[freqs < 20] = 0.0
+    is_tensor = isinstance(freqs, torch.Tensor)
     
+    if is_tensor:
+        freqs_np = freqs.cpu().numpy()
+    else:
+        freqs_np = np.asarray(freqs)
+    
+    # Flat below 1kHz, -12dB/octave rolloff above
+    weights = np.ones_like(freqs_np, dtype=np.float32)
+    
+    f_corner = 1000.0  # Corner frequency
+    high_mask = freqs_np > f_corner
+    
+    if np.any(high_mask):
+        # -12dB/octave = factor of 4 per octave = (f/f_corner)^(-2)
+        weights[high_mask] = (f_corner / freqs_np[high_mask]) ** 2
+    
+    # Apply low frequency rolloff below 20Hz (inaudible)
+    low_mask = freqs_np < 20.0
+    if np.any(low_mask):
+        weights[low_mask] = (freqs_np[low_mask] / 20.0) ** 2
+    
+    # Handle DC (0 Hz)
+    weights[freqs_np == 0] = 0.0
+    
+    if is_tensor:
+        return torch.from_numpy(weights).to(freqs.device)
     return weights
 
 
-def a_weight(freqs: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+def a_weight(freqs: np.ndarray) -> np.ndarray:
     """
-    Standard A-weighting curve (IEC 61672) for hiss level measurement.
+    Standard A-weighting curve (for comparison/reference).
     
-    Note: Do NOT use for training loss - A-weighting ignores bass
-    where ANC is most needed. Use modified_c_weight instead.
+    Note: A-weighting de-emphasizes low frequencies, which is
+    NOT ideal for ANC loss. Use modified_c_weight instead.
     
     Args:
-        freqs: Frequency values in Hz
+        freqs: Frequency array in Hz
     
     Returns:
-        A-weighting values (linear scale)
+        Weight array in dB
     """
-    if isinstance(freqs, torch.Tensor):
-        f2 = freqs ** 2
-        # A-weighting formula
-        num = 12194 ** 2 * f2 ** 2
-        denom = (f2 + 20.6 ** 2) * torch.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2)) * (f2 + 12194 ** 2)
-        ra = num / (denom + 1e-10)
-        # Normalize to 0dB at 1kHz
-        ra = ra / (ra[torch.argmin(torch.abs(freqs - 1000))] + 1e-10)
-    else:
-        f2 = freqs ** 2
-        num = 12194 ** 2 * f2 ** 2
-        denom = (f2 + 20.6 ** 2) * np.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2)) * (f2 + 12194 ** 2)
-        ra = num / (denom + 1e-10)
-        idx_1k = np.argmin(np.abs(freqs - 1000))
-        ra = ra / (ra[idx_1k] + 1e-10)
+    freqs = np.asarray(freqs, dtype=np.float64)
+    freqs = np.clip(freqs, 1e-6, None)  # Avoid division by zero
     
-    return ra
+    # A-weighting formula (IEC 61672-1)
+    f2 = freqs ** 2
+    
+    numerator = 12194**2 * f2**2
+    denominator = ((f2 + 20.6**2) * 
+                   np.sqrt((f2 + 107.7**2) * (f2 + 737.9**2)) * 
+                   (f2 + 12194**2))
+    
+    Ra = numerator / (denominator + 1e-10)
+    A_db = 20 * np.log10(Ra + 1e-10) + 2.0  # +2dB normalization at 1kHz
+    
+    return A_db
 
 
-def generate_leakage_tf(fs: int = 48000, leak_type: str = "light") -> np.ndarray:
+def generate_leakage_tf(n_taps: int = 64, fs: int = 48000) -> np.ndarray:
     """
-    Generate a 'leaky fit' transfer function for augmentation.
+    Generate a "leaky fit" transfer function for augmentation.
     
-    Simulates acoustic leakage when headphones don't seal properly
-    (glasses, hair, loose fit). Creates characteristic low-frequency
-    notch and phase roll-off.
+    Simulates imperfect acoustic seal in headphones - some
+    low-frequency energy leaks in from the environment.
     
     Args:
+        n_taps: Filter length
         fs: Sample rate
-        leak_type: "light", "medium", or "heavy" leakage
     
     Returns:
-        Impulse response of leakage transfer function
+        FIR filter coefficients
     """
-    # Leakage creates a high-pass like effect with resonances
-    leak_params = {
-        "light": {"fc": 80, "q": 0.7, "gain_db": -3},
-        "medium": {"fc": 150, "q": 0.5, "gain_db": -6},
-        "heavy": {"fc": 300, "q": 0.4, "gain_db": -12}
-    }
+    # High-pass characteristic (leakage affects lows)
+    # Cutoff around 100-200Hz
+    cutoff = np.random.uniform(80, 200)
     
-    params = leak_params.get(leak_type, leak_params["light"])
+    b = signal.firwin(n_taps, cutoff / (fs / 2), pass_zero=False)
     
-    # Create high-shelf filter to simulate bass loss
-    nyq = fs / 2
-    fc_norm = params["fc"] / nyq
+    # Add some gain variation
+    gain = np.random.uniform(0.7, 1.0)
     
-    if fc_norm >= 1:
-        fc_norm = 0.9
+    return b * gain
+
+
+def db_to_linear(db: float) -> float:
+    """Convert decibels to linear scale."""
+    return 10 ** (db / 20)
+
+
+def linear_to_db(linear: float) -> float:
+    """Convert linear scale to decibels."""
+    return 20 * np.log10(linear + 1e-10)
+
+
+def rms(x: np.ndarray) -> float:
+    """Calculate RMS (Root Mean Square) of signal."""
+    return np.sqrt(np.mean(x ** 2))
+
+
+def normalize_audio(audio: np.ndarray, target_db: float = -3.0) -> np.ndarray:
+    """
+    Normalize audio to target dB level.
     
-    # Design a simple high-pass to simulate seal leakage
-    b, a = signal.butter(2, fc_norm, btype='high')
+    Args:
+        audio: Input audio signal
+        target_db: Target peak level in dB (e.g., -3.0)
     
-    # Get impulse response
-    impulse = np.zeros(256)
-    impulse[0] = 1.0
-    ir = signal.lfilter(b, a, impulse)
+    Returns:
+        Normalized audio
+    """
+    peak = np.max(np.abs(audio))
+    if peak < 1e-8:
+        return audio
     
-    # Apply gain
-    ir = ir * db_to_linear(params["gain_db"])
-    
-    # Blend with direct path (leakage doesn't remove all bass)
-    blend = 0.7 if leak_type == "light" else 0.5 if leak_type == "medium" else 0.3
-    ir[0] += blend
-    
-    return ir
+    target_linear = db_to_linear(target_db)
+    return audio * (target_linear / peak)
 

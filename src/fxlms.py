@@ -1,8 +1,8 @@
 """
-Filtered-x Least Mean Squares (FxLMS) Adaptive Filter.
+FxLMS (Filtered-x Least Mean Squares) Adaptive Filter.
 
-The linear component of the hybrid ANC system, handling broadband
-noise cancellation in the 20-800Hz range.
+The workhorse of ANC - handles broadband linear noise effectively.
+Works in parallel with Mamba (NOT serial!) to avoid decorrelation.
 """
 
 import numpy as np
@@ -13,189 +13,230 @@ class FxLMS:
     """
     Filtered-x LMS adaptive filter for ANC.
     
-    Standard FxLMS algorithm with safety features:
-    - Weight normalization to prevent divergence
-    - Emergency reset capability
-    - Gradient clipping
+    Key features:
+    - Filtered-x algorithm: Uses estimate of secondary path S(z)
+    - Leaky integration: Prevents weight explosion
+    - Gradient clipping: Stabilizes adaptation
     """
     
     def __init__(
         self,
         n_taps: int = 64,
-        learning_rate: float = 0.005,
-        secondary_path_estimate: Optional[np.ndarray] = None,
-        leakage: float = 0.9999
+        mu: float = 0.005,
+        leakage: float = 0.9999,
+        s_hat: Optional[np.ndarray] = None,
+        grad_clip: float = 1.0
     ):
         """
         Initialize FxLMS filter.
         
         Args:
-            n_taps: Number of filter taps (length of adaptive filter)
-            learning_rate: Step size mu (tune: increase until unstable, back off 50%)
-            secondary_path_estimate: S_hat(z) for filtering reference signal
-            leakage: Leaky LMS coefficient (prevents DC drift, 0.999-0.9999)
+            n_taps: Number of filter taps (64-128 typical for ANC)
+            mu: Step size / learning rate (tune until unstable, back off 50%)
+            leakage: Leaky LMS coefficient (prevents weight growth)
+            s_hat: Estimate of secondary path S(z), or None for identity
+            grad_clip: Gradient clipping threshold
         """
         self.n_taps = n_taps
-        self.mu = learning_rate
+        self.mu = mu
         self.leakage = leakage
+        self.grad_clip = grad_clip
         
-        # Adaptive filter weights
-        self.w = np.zeros(n_taps)
+        # Filter weights
+        self.w = np.zeros(n_taps, dtype=np.float32)
         
-        # Reference signal buffer for prediction
-        self.x_buffer = np.zeros(n_taps)
+        # Input buffer (reference signal history)
+        self.x_buffer = np.zeros(n_taps, dtype=np.float32)
         
-        # Filtered-x buffer for weight update
-        self.fx_buffer = np.zeros(n_taps)
+        # Filtered-x buffer (reference filtered through S_hat)
+        self.fx_buffer = np.zeros(n_taps, dtype=np.float32)
         
-        # Secondary path estimate and history buffer
-        if secondary_path_estimate is not None:
-            self.s_hat = secondary_path_estimate
+        # Secondary path estimate
+        if s_hat is not None:
+            self.s_hat = s_hat.astype(np.float32)
         else:
-            # Default: simple delay approximation
-            self.s_hat = np.zeros(64)
-            self.s_hat[3] = 1.0  # ~60µs delay at 48kHz
+            # Identity (assumes perfect secondary path knowledge)
+            self.s_hat = np.zeros(32, dtype=np.float32)
+            self.s_hat[0] = 1.0
         
-        self.s_hat_len = len(self.s_hat)
-        self.ref_history = np.zeros(self.s_hat_len)
-        
-        # Power normalization for NLMS variant
-        self.power_estimate = 0.001
-        self.power_alpha = 0.99
+        # Buffer for S_hat filtering
+        self.s_buffer = np.zeros(len(self.s_hat), dtype=np.float32)
     
-    def update(self, x_n: float, e_n: float) -> None:
+    def predict(self, x_n: float) -> float:
         """
-        Update adaptive filter weights using FxLMS algorithm.
-        
-        Weight update: w(n+1) = leakage * w(n) + mu * e(n) * x'(n)
-        where x'(n) is the reference signal filtered through S_hat.
+        Generate anti-noise prediction for current sample.
         
         Args:
             x_n: Current reference microphone sample
-            e_n: Current error microphone sample
-        """
-        # Update reference history for S_hat filtering
-        self.ref_history = np.roll(self.ref_history, 1)
-        self.ref_history[0] = x_n
         
-        # Compute filtered reference: x'(n) = s_hat * x(n)
-        x_filtered = np.dot(self.ref_history, self.s_hat)
+        Returns:
+            y_n: Anti-noise output sample
+        """
+        # Shift input buffer and add new sample
+        self.x_buffer = np.roll(self.x_buffer, 1)
+        self.x_buffer[0] = x_n
+        
+        # Compute output: y = w^T * x
+        y_n = np.dot(self.w, self.x_buffer)
+        
+        return y_n
+    
+    def update(self, x_n: float, e_n: float) -> None:
+        """
+        Update filter weights based on error signal.
+        
+        Uses Filtered-x LMS:
+        w(n+1) = leakage * w(n) - mu * e(n) * x'(n)
+        
+        where x'(n) is x(n) filtered through S_hat.
+        
+        IMPORTANT: The negative sign is critical for minimizing error.
+        
+        Args:
+            x_n: Current reference sample (already in buffer from predict)
+            e_n: Error microphone sample
+        """
+        # Update S_hat buffer for filtered-x computation
+        self.s_buffer = np.roll(self.s_buffer, 1)
+        self.s_buffer[0] = x_n
+        
+        # Compute filtered reference: x' = S_hat * x
+        x_filtered = np.dot(self.s_hat, self.s_buffer[:len(self.s_hat)])
         
         # Update filtered-x buffer
         self.fx_buffer = np.roll(self.fx_buffer, 1)
         self.fx_buffer[0] = x_filtered
         
-        # Power estimate for NLMS normalization
-        self.power_estimate = (
-            self.power_alpha * self.power_estimate +
-            (1 - self.power_alpha) * (x_filtered ** 2)
-        )
+        # Normalized step size (NLMS-style)
+        power = np.dot(self.fx_buffer, self.fx_buffer) + 1e-8
+        mu_normalized = self.mu / power
         
-        # Normalized step size
-        mu_normalized = self.mu / (self.power_estimate + 1e-8)
-        
-        # Gradient for minimizing e² in ANC: w = w - mu * e * x'
-        # The negative sign is critical - we want y*S(z) to approach -d(n)
+        # Compute gradient: e * x'
         gradient = e_n * self.fx_buffer
         
         # Gradient clipping for stability
         grad_norm = np.linalg.norm(gradient)
-        if grad_norm > 1.0:
-            gradient = gradient / grad_norm
+        if grad_norm > self.grad_clip:
+            gradient = gradient * (self.grad_clip / grad_norm)
         
-        # LMS weight update with leakage (prevents DC drift)
-        # NEGATIVE sign for gradient descent to minimize error
+        # Weight update: w = leakage*w - mu*e*x' (NEGATIVE for gradient descent!)
         self.w = self.leakage * self.w - mu_normalized * gradient
     
-    def predict(self, x_n: float) -> float:
-        """
-        Generate anti-noise prediction.
-        
-        Args:
-            x_n: Current reference microphone sample
-        
-        Returns:
-            Anti-noise output sample
-        """
-        # Update reference buffer
-        self.x_buffer = np.roll(self.x_buffer, 1)
-        self.x_buffer[0] = x_n
-        
-        # FIR filter output
-        y = np.dot(self.w, self.x_buffer)
-        
-        return y
-    
-    def step(self, x_n: float, e_n: float) -> float:
-        """
-        Combined predict and update in one call.
-        
-        Note: Uses PREVIOUS error for update (causality).
-        
-        Args:
-            x_n: Current reference sample
-            e_n: Previous error sample
-        
-        Returns:
-            Current anti-noise output
-        """
-        # First update weights with previous error
-        self.update(x_n, e_n)
-        
-        # Then generate prediction
-        return self.predict(x_n)
-    
-    def reset_weights(self) -> None:
-        """
-        Emergency reset: zero all weights.
-        
-        Called by watchdog when instability is detected.
-        """
-        self.w = np.zeros(self.n_taps)
-        self.x_buffer = np.zeros(self.n_taps)
-        self.fx_buffer = np.zeros(self.n_taps)
-        self.ref_history = np.zeros(self.s_hat_len)
-        self.power_estimate = 0.001
-    
-    def set_learning_rate(self, mu: float) -> None:
-        """Dynamically adjust learning rate."""
-        self.mu = mu
+    def reset_weights(self):
+        """Reset filter weights to zero (emergency bypass)."""
+        self.w.fill(0)
+        self.x_buffer.fill(0)
+        self.fx_buffer.fill(0)
+        self.s_buffer.fill(0)
     
     def get_weights(self) -> np.ndarray:
         """Get current filter weights."""
         return self.w.copy()
     
-    def set_weights(self, weights: np.ndarray) -> None:
-        """Set filter weights (for initialization or transfer)."""
-        if len(weights) != self.n_taps:
-            raise ValueError(f"Weight length {len(weights)} != n_taps {self.n_taps}")
-        self.w = weights.copy()
+    def set_weights(self, w: np.ndarray) -> None:
+        """Set filter weights (for loading checkpoints)."""
+        assert len(w) == self.n_taps
+        self.w = w.astype(np.float32)
     
-    def get_filter_response(self, n_fft: int = 1024) -> tuple:
+    def set_s_hat(self, s_hat: np.ndarray) -> None:
         """
-        Compute frequency response of current filter.
+        Update secondary path estimate.
+        
+        In real systems, S_hat is identified online or offline.
+        """
+        self.s_hat = s_hat.astype(np.float32)
+        self.s_buffer = np.zeros(len(self.s_hat), dtype=np.float32)
+
+
+class FxLMSBlock:
+    """
+    Block-based FxLMS for efficient processing.
+    
+    Processes multiple samples at once using matrix operations.
+    More efficient than sample-by-sample for training/simulation.
+    """
+    
+    def __init__(
+        self,
+        n_taps: int = 64,
+        block_size: int = 64,
+        mu: float = 0.005,
+        leakage: float = 0.9999,
+        s_hat: Optional[np.ndarray] = None
+    ):
+        """
+        Initialize block FxLMS.
         
         Args:
-            n_fft: FFT size
+            n_taps: Number of filter taps
+            block_size: Processing block size
+            mu: Step size
+            leakage: Leaky coefficient
+            s_hat: Secondary path estimate
+        """
+        self.n_taps = n_taps
+        self.block_size = block_size
+        self.mu = mu
+        self.leakage = leakage
+        
+        self.w = np.zeros(n_taps, dtype=np.float32)
+        
+        if s_hat is not None:
+            self.s_hat = s_hat.astype(np.float32)
+        else:
+            self.s_hat = np.zeros(32, dtype=np.float32)
+            self.s_hat[0] = 1.0
+        
+        # State buffers
+        self.x_state = np.zeros(n_taps + block_size - 1, dtype=np.float32)
+    
+    def process_block(
+        self,
+        x_block: np.ndarray,
+        e_block: np.ndarray
+    ) -> np.ndarray:
+        """
+        Process a block of samples.
+        
+        Args:
+            x_block: Reference signal block (block_size,)
+            e_block: Error signal block (block_size,)
         
         Returns:
-            Tuple of (frequencies, magnitude_db, phase_rad)
+            y_block: Anti-noise output block (block_size,)
         """
-        # Zero-pad weights for FFT
-        w_padded = np.zeros(n_fft)
-        w_padded[:len(self.w)] = self.w
+        block_size = len(x_block)
         
-        # FFT
-        W = np.fft.rfft(w_padded)
+        # Update state buffer
+        self.x_state = np.roll(self.x_state, -block_size)
+        self.x_state[-block_size:] = x_block
         
-        # Frequency axis (assuming 48kHz)
-        freqs = np.fft.rfftfreq(n_fft, d=1/48000)
+        # Build Toeplitz-like matrix for convolution
+        X = np.zeros((block_size, self.n_taps), dtype=np.float32)
+        for i in range(block_size):
+            X[i] = self.x_state[self.n_taps - 1 + i::-1][:self.n_taps]
         
-        # Magnitude in dB
-        mag_db = 20 * np.log10(np.abs(W) + 1e-10)
+        # Output: y = X @ w
+        y_block = X @ self.w
         
-        # Phase in radians
-        phase_rad = np.angle(W)
+        # Filtered-x (simplified - using X directly)
+        Xf = np.convolve(x_block, self.s_hat, mode='full')[:block_size]
         
-        return freqs, mag_db, phase_rad
+        # Gradient accumulation
+        gradient = np.zeros(self.n_taps, dtype=np.float32)
+        for i in range(block_size):
+            gradient += e_block[i] * X[i] * Xf[i]
+        
+        gradient /= block_size
+        
+        # Weight update
+        power = np.mean(Xf ** 2) + 1e-8
+        self.w = self.leakage * self.w - (self.mu / power) * gradient
+        
+        return y_block
+    
+    def reset(self):
+        """Reset filter state."""
+        self.w.fill(0)
+        self.x_state.fill(0)
 

@@ -1,0 +1,120 @@
+{
+  "experiment": {
+    "date": "2025-12-21",
+    "time": "15:38:09",
+    "model": "TinyMamba",
+    "model_size": "tiny",
+    "dataset": "ESC-50",
+    "duration_seconds": 5.0,
+    "sample_rate": 48000,
+    "chunk_size": 64,
+    "fxlms_taps": 64,
+    "fxlms_mu": 0.0005,
+    "mamba_gain": 0.3,
+    "delay_compensation_K": 3
+  },
+  "global_metrics": {
+    "nmse_db": -16.98,
+    "ail_db": 16.95,
+    "boost_probability_percent": 2.04,
+    "rms_reduction_db": 16.24,
+    "rms_reduction_factor": 7.04,
+    "convergence_time_seconds": 0.11,
+    "watchdog_triggered": false
+  },
+  "frequency_band_performance": {
+    "31.5_hz": {
+      "center_freq_hz": 31.5,
+      "ail_db": 11.6,
+      "std_db": 1.01
+    },
+    "63_hz": {
+      "center_freq_hz": 63,
+      "ail_db": 18.48,
+      "std_db": 1.44
+    },
+    "125_hz": {
+      "center_freq_hz": 125,
+      "ail_db": 20.4,
+      "std_db": 1.1
+    },
+    "250_hz": {
+      "center_freq_hz": 250,
+      "ail_db": 15.63,
+      "std_db": 1.44
+    },
+    "500_hz": {
+      "center_freq_hz": 500,
+      "ail_db": 11.04,
+      "std_db": 1.76
+    },
+    "1000_hz": {
+      "center_freq_hz": 1000,
+      "ail_db": 4.32,
+      "std_db": 2.06
+    }
+  },
+  "ablation_study": {
+    "fxlms_only": {
+      "ail_db": 12.29,
+      "boost_probability_percent": 4.27,
+      "nmse_db": -12.19
+    },
+    "mamba_only": {
+      "ail_db": 10.05,
+      "boost_probability_percent": 6.42,
+      "nmse_db": -9.91
+    },
+    "hybrid_fxlms_mamba": {
+      "ail_db": 16.95,
+      "boost_probability_percent": 1.72,
+      "nmse_db": -16.99,
+      "improvement_over_fxlms_db": 4.85
+    }
+  },
+  "noise_type_performance": {
+    "engine_50hz": {
+      "description": "Engine harmonics (50Hz fundamental)",
+      "ail_db": 20.57,
+      "boost_probability_percent": 0.72
+    },
+    "broadband_traffic": {
+      "description": "Low-frequency broadband traffic noise",
+      "ail_db": 13.72,
+      "boost_probability_percent": 2.86
+    },
+    "mixed": {
+      "description": "Engine + broadband mixture",
+      "ail_db": 16.02,
+      "boost_probability_percent": 1.86
+    },
+    "hvac_drone": {
+      "description": "HVAC low-frequency drone",
+      "ail_db": 18.38,
+      "boost_probability_percent": 1.47
+    }
+  },
+  "model_info": {
+    "architecture": "TinyMamba",
+    "backend": "mamba-ssm 1.2.0",
+    "ssm_type": "S6 (Selective State Space)",
+    "encoder": "Conv1d(1, 32, k=4, stride=2)",
+    "core": "2x Mamba blocks (d_model=32, d_state=16, expand=2)",
+    "decoder": "ConvTranspose1d(32, 1, k=4, stride=2)",
+    "total_parameters": 15872,
+    "trainable_parameters": 15872,
+    "state_dimension": 16,
+    "expand_factor": 2,
+    "inference_latency_ms": 0.61,
+    "memory_mb": 0.06
+  },
+  "training_info": {
+    "epochs": 50,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "optimizer": "AdamW",
+    "loss_function": "Composite (time + C-weighted spectral + phase)",
+    "final_train_loss": 0.0175,
+    "final_val_loss": 0.024
+  }
+}

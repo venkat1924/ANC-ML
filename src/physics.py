@@ -1,167 +1,162 @@
 """
-Acoustic Digital Twin: Physics simulation for ANC system.
+Acoustic Digital Twin for ANC Simulation.
 
-Simulates the parallel acoustic paths in a headphone ANC system:
-- RIR_ref: Noise source → Reference microphone
-- P(z): Noise source → Ear (primary path)
-- S(z): Speaker → Ear (secondary path)
+Simulates three parallel acoustic paths:
+1. RIR_ref: Noise source → Reference microphone
+2. P_z: Noise source → Ear (primary path)  
+3. S_z: Speaker → Ear (secondary path)
 
-Also includes speaker nonlinearity (Volterra) for realistic simulation.
+Also includes speaker nonlinearity (Volterra series).
 """
 
 import numpy as np
-import scipy.signal as signal
-
-try:
-    import pyroomacoustics as pra
-    HAS_PRA = True
-except ImportError:
-    HAS_PRA = False
+from scipy import signal
+from typing import Optional, Tuple
 
 
 class AcousticPhysics:
     """
-    Acoustic Digital Twin for headphone ANC simulation.
+    Acoustic physics simulation for headphone ANC.
     
     Models the complete acoustic environment including:
-    - Primary path (noise to ear)
-    - Secondary path (speaker to ear) 
-    - Reference microphone path
-    - Speaker nonlinearity (Volterra series)
-    - Hardware latency (ADC/DAC)
+    - Reference microphone pickup
+    - Primary noise path to ear
+    - Secondary (speaker) path to ear
+    - Speaker nonlinearity at high drive levels
     """
     
     def __init__(
         self,
         fs: int = 48000,
-        hardware_delay_samples: int = 3,
-        ir_length: int = 256,
-        use_pyroomacoustics: bool = True
+        rir_length: int = 256,
+        primary_delay_ms: float = 0.5,
+        secondary_delay_ms: float = 0.2,
+        use_realistic_paths: bool = True,
+        seed: Optional[int] = None
     ):
         """
         Initialize acoustic physics simulation.
         
         Args:
-            fs: Sample rate in Hz
-            hardware_delay_samples: ADC+DAC latency (~60µs at 48kHz = 3 samples)
-            ir_length: Length of impulse responses
-            use_pyroomacoustics: Use pyroomacoustics for RIR generation if available
+            fs: Sample rate
+            rir_length: Length of impulse responses in samples
+            primary_delay_ms: Primary path delay in milliseconds
+            secondary_delay_ms: Secondary path delay in milliseconds
+            use_realistic_paths: Use realistic frequency-dependent paths
+            seed: Random seed for reproducibility
         """
         self.fs = fs
-        self.hardware_delay = hardware_delay_samples
-        self.ir_length = ir_length
+        self.rir_length = rir_length
+        self.primary_delay_samples = int(primary_delay_ms * fs / 1000)
+        self.secondary_delay_samples = int(secondary_delay_ms * fs / 1000)
         
-        # Generate the three distinct acoustic paths
-        if use_pyroomacoustics and HAS_PRA:
-            self._generate_paths_pra()
+        if seed is not None:
+            np.random.seed(seed)
+        
+        if use_realistic_paths:
+            self._generate_realistic_paths()
         else:
-            self._generate_paths_synthetic()
-        
-        # Create imperfect estimate of secondary path for FxLMS
-        # In real systems, this is measured via system identification
-        self.S_z_hat = self._create_path_estimate(self.S_z, mismatch=0.1)
-        
-        # Buffers for real-time convolution
-        self.ref_buffer = np.zeros(len(self.RIR_ref))
-        self.primary_buffer = np.zeros(len(self.P_z))
-        self.secondary_buffer = np.zeros(len(self.S_z))
+            self._generate_simple_paths()
     
-    def _generate_paths_pra(self):
-        """Generate impulse responses using pyroomacoustics."""
-        # Reference mic path: noise source to external mic
-        # Simulates open-air propagation with some reflections
-        room_ref = pra.ShoeBox(
-            [3.0, 3.0, 2.5],  # Room dimensions (m)
-            fs=self.fs,
-            max_order=5,
-            absorption=0.4
-        )
-        room_ref.add_source([1.5, 1.5, 1.5])  # Noise source
-        room_ref.add_microphone([1.6, 1.5, 1.5])  # Ref mic (10cm from source)
-        room_ref.compute_rir()
-        self.RIR_ref = room_ref.rir[0][0][:self.ir_length]
-        self.RIR_ref = self.RIR_ref / (np.max(np.abs(self.RIR_ref)) + 1e-10)
+    def _generate_realistic_paths(self):
+        """Generate frequency-dependent realistic acoustic paths."""
         
-        # Primary path: noise source to ear (through headphone shell)
-        # Longer path with more attenuation at high frequencies
-        room_primary = pra.ShoeBox(
-            [3.0, 3.0, 2.5],
-            fs=self.fs,
-            max_order=8,
-            absorption=0.3
+        # Reference mic path: External noise → reference mic
+        # Strong pickup, relatively flat response
+        self.RIR_ref = self._create_path(
+            gain=0.9,
+            delay=2,
+            lowpass_hz=8000,
+            decay_time_ms=5
         )
-        room_primary.add_source([1.5, 1.5, 1.5])
-        room_primary.add_microphone([1.65, 1.5, 1.5])  # Ear position (15cm from source)
-        room_primary.compute_rir()
-        self.P_z = room_primary.rir[0][0][:self.ir_length]
-        self.P_z = self.P_z / (np.max(np.abs(self.P_z)) + 1e-10)
         
-        # Apply low-pass to simulate passive isolation of ear cup
+        # Primary path: External noise → ear (through headphone seal)
+        # Weaker (passive isolation), bass-heavy (low freq leaks through)
+        self.P_z = self._create_path(
+            gain=0.3,  # Passive isolation reduces this
+            delay=self.primary_delay_samples,
+            lowpass_hz=2000,  # High frequencies blocked by cups
+            decay_time_ms=10
+        )
+        
+        # Secondary path: Speaker → ear
+        # Strong, relatively flat (speaker is close to ear)
+        self.S_z = self._create_path(
+            gain=0.8,
+            delay=self.secondary_delay_samples,
+            lowpass_hz=12000,
+            decay_time_ms=3
+        )
+    
+    def _create_path(
+        self,
+        gain: float,
+        delay: int,
+        lowpass_hz: float,
+        decay_time_ms: float
+    ) -> np.ndarray:
+        """Create a single acoustic path impulse response."""
+        
+        # Start with impulse
+        ir = np.zeros(self.rir_length)
+        ir[min(delay, self.rir_length - 1)] = gain
+        
+        # Add exponential decay (room reflections)
+        decay_samples = int(decay_time_ms * self.fs / 1000)
+        decay = np.exp(-np.arange(self.rir_length) / max(decay_samples, 1))
+        
+        # Add some early reflections
+        n_reflections = 3
+        for i in range(n_reflections):
+            ref_delay = delay + int((i + 1) * decay_samples * 0.3)
+            if ref_delay < self.rir_length:
+                ir[ref_delay] += gain * 0.2 * (0.5 ** i) * (1 if np.random.rand() > 0.5 else -1)
+        
+        ir *= decay
+        
+        # Apply lowpass characteristic
         nyq = self.fs / 2
-        b, a = signal.butter(2, 800 / nyq, btype='low')
-        self.P_z = signal.lfilter(b, a, self.P_z)
-        self.P_z = self.P_z / (np.max(np.abs(self.P_z)) + 1e-10)
+        cutoff = min(lowpass_hz / nyq, 0.99)
+        b, a = signal.butter(2, cutoff, btype='low')
+        ir = signal.lfilter(b, a, ir)
         
-        # Secondary path: speaker to ear (inside ear cup)
-        # Short, near-field, relatively clean
-        room_sec = pra.ShoeBox(
-            [0.1, 0.1, 0.05],  # Ear cup dimensions
-            fs=self.fs,
-            max_order=10,
-            absorption=0.3
-        )
-        room_sec.add_source([0.02, 0.05, 0.025])  # Speaker driver
-        room_sec.add_microphone([0.08, 0.05, 0.025])  # Error mic near ear
-        room_sec.compute_rir()
-        self.S_z = room_sec.rir[0][0][:self.ir_length]
-        self.S_z = self.S_z / (np.max(np.abs(self.S_z)) + 1e-10) * 0.8
+        # Normalize
+        ir = ir / (np.max(np.abs(ir)) + 1e-8) * gain
         
-        # Prepend hardware delay to secondary path
-        self.S_z = np.pad(self.S_z, (self.hardware_delay, 0))[:self.ir_length]
+        return ir.astype(np.float32)
     
-    def _generate_paths_synthetic(self):
-        """Generate synthetic impulse responses (fallback without pyroomacoustics)."""
-        # Reference path: Ref mic is close to noise source
-        # Direct path with minimal delay, high gain
-        self.RIR_ref = np.zeros(self.ir_length)
-        self.RIR_ref[1] = 0.9  # Direct
-        self.RIR_ref[4] = 0.1  # Reflection
+    def _generate_simple_paths(self):
+        """Generate simple exponential decay paths."""
         
-        # Primary path: Noise travels around headphone to ear
-        # Delayed and ATTENUATED by passive isolation
-        # Key: P_z should have similar shape but LOWER gain
-        self.P_z = np.zeros(self.ir_length)
-        self.P_z[8] = 0.4  # Main path (delayed, attenuated by ~7dB)
-        self.P_z[12] = 0.1  # Reflection
-        self.P_z[18] = 0.05
+        decay = np.exp(-np.arange(self.rir_length) / 30)
         
-        # Secondary path: Speaker to ear (inside ear cup)
-        # Short delay (hardware + acoustic), direct
-        self.S_z = np.zeros(self.ir_length)
-        self.S_z[self.hardware_delay] = 0.8  # Direct
-        self.S_z[self.hardware_delay + 3] = 0.1  # Reflection
+        # Reference mic - strong, immediate
+        self.RIR_ref = np.zeros(self.rir_length)
+        self.RIR_ref[0] = 0.9
+        self.RIR_ref *= decay
+        
+        # Primary path - delayed, weaker
+        self.P_z = np.zeros(self.rir_length)
+        self.P_z[self.primary_delay_samples] = 0.3
+        self.P_z *= decay
+        
+        # Secondary path - speaker to ear
+        self.S_z = np.zeros(self.rir_length)
+        self.S_z[self.secondary_delay_samples] = 0.8
+        self.S_z *= decay
     
-    def _create_path_estimate(self, true_path: np.ndarray, mismatch: float = 0.1) -> np.ndarray:
+    def apply_path(self, signal_in: np.ndarray, ir: np.ndarray) -> np.ndarray:
         """
-        Create imperfect estimate of a path (for FxLMS).
-        
-        In real systems, this represents measurement error in system ID.
+        Apply impulse response to signal.
         
         Args:
-            true_path: True impulse response
-            mismatch: Amount of mismatch (0-1)
+            signal_in: Input signal
+            ir: Impulse response
         
         Returns:
-            Estimated path with added error
+            Convolved output (same length as input)
         """
-        # Scale and add noise
-        estimate = true_path * (1.0 - mismatch / 2)
-        noise = np.random.normal(0, mismatch * 0.1, len(true_path))
-        estimate = estimate + noise
-        
-        # Small timing error (shift by fraction of a sample)
-        # This simulates temperature-dependent speed of sound changes
-        return estimate
+        return np.convolve(signal_in, ir, mode='same')
     
     def speaker_nonlinearity(self, x: np.ndarray, drive_level: float = 0.8) -> np.ndarray:
         """
@@ -171,36 +166,22 @@ class AcousticPhysics:
         At high drive levels, speakers exhibit 3rd-order distortion.
         
         Args:
-            x: Input signal (drive voltage)
-            drive_level: Normalized drive level (higher = more distortion)
+            x: Input signal (drive signal to speaker)
+            drive_level: How hard the speaker is being driven (0-1)
         
         Returns:
-            Distorted output signal
+            Nonlinear speaker output
         """
-        # 3rd-order polynomial approximation of speaker transfer function
-        # y = x - a*x^3 (soft saturation)
-        # Coefficient scales with drive level
+        # Volterra 3rd-order nonlinearity
+        # y = x - a*x^3 where a increases with drive level
         a = 0.1 * drive_level
         return x - a * (x ** 3)
-    
-    def apply_path(self, audio: np.ndarray, path: np.ndarray) -> np.ndarray:
-        """
-        Convolve audio with an impulse response.
-        
-        Args:
-            audio: Input audio signal
-            path: Impulse response
-        
-        Returns:
-            Convolved signal (same length as input)
-        """
-        return signal.fftconvolve(audio, path, mode='full')[:len(audio)]
     
     def simulate_paths(
         self,
         noise_source: np.ndarray,
         drive_signal: np.ndarray
-    ) -> tuple:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Simulate complete acoustic paths.
         
@@ -208,74 +189,76 @@ class AcousticPhysics:
         at the error microphone.
         
         Args:
-            noise_source: External noise signal
-            drive_signal: Anti-noise drive signal
+            noise_source: External noise source signal
+            drive_signal: ANC output drive signal
         
         Returns:
-            Tuple of (reference_mic, error_mic, noise_at_ear, anti_at_ear)
+            ref_mic: Reference microphone signal
+            error_mic: Error microphone signal (noise + anti-noise)
+            noise_at_ear: Noise component at ear
+            anti_at_ear: Anti-noise component at ear
         """
-        # Path 1: Noise to reference microphone
+        # Reference mic picks up external noise
         ref_mic = self.apply_path(noise_source, self.RIR_ref)
         
-        # Path 2: Noise to ear (primary path)
+        # Noise leaks to ear through primary path
         noise_at_ear = self.apply_path(noise_source, self.P_z)
         
-        # Path 3: Drive through speaker nonlinearity then secondary path
+        # Anti-noise from speaker (with nonlinearity) through secondary path
         speaker_out = self.speaker_nonlinearity(drive_signal)
         anti_at_ear = self.apply_path(speaker_out, self.S_z)
         
-        # Error microphone: PARALLEL summation
+        # Error mic sees sum of noise and anti-noise (parallel paths!)
         error_mic = noise_at_ear + anti_at_ear
         
         return ref_mic, error_mic, noise_at_ear, anti_at_ear
     
-    def step(
+    def simulate_sample(
         self,
         noise_sample: float,
-        drive_sample: float
-    ) -> tuple:
+        drive_sample: float,
+        noise_buffer: np.ndarray,
+        drive_buffer: np.ndarray
+    ) -> Tuple[float, float, float]:
         """
-        Single-sample physics simulation for real-time loop.
-        
-        Uses internal buffers for efficient sample-by-sample convolution.
+        Sample-by-sample simulation for real-time loop.
         
         Args:
             noise_sample: Current noise source sample
             drive_sample: Current drive signal sample
+            noise_buffer: Buffer of recent noise samples
+            drive_buffer: Buffer of recent drive samples
         
         Returns:
-            Tuple of (ref_mic_sample, error_sample)
+            ref_sample: Reference mic sample
+            error_sample: Error mic sample
+            noise_at_ear: Noise component at ear
         """
-        # Update reference buffer and compute output
-        self.ref_buffer = np.roll(self.ref_buffer, 1)
-        self.ref_buffer[0] = noise_sample
-        ref_out = np.dot(self.ref_buffer, self.RIR_ref[:len(self.ref_buffer)])
+        # Update buffers
+        noise_buffer = np.roll(noise_buffer, 1)
+        noise_buffer[0] = noise_sample
         
-        # Update primary buffer and compute noise at ear
-        self.primary_buffer = np.roll(self.primary_buffer, 1)
-        self.primary_buffer[0] = noise_sample
-        noise_at_ear = np.dot(self.primary_buffer, self.P_z[:len(self.primary_buffer)])
+        drive_buffer = np.roll(drive_buffer, 1)
+        drive_buffer[0] = self.speaker_nonlinearity(np.array([drive_sample]))[0]
         
-        # Apply speaker nonlinearity
-        speaker_out = self.speaker_nonlinearity(np.array([drive_sample]))[0]
+        # Convolve with truncated IRs
+        ref_sample = np.dot(noise_buffer[:len(self.RIR_ref)], self.RIR_ref)
+        noise_at_ear = np.dot(noise_buffer[:len(self.P_z)], self.P_z)
+        anti_at_ear = np.dot(drive_buffer[:len(self.S_z)], self.S_z)
         
-        # Update secondary buffer and compute anti-noise at ear
-        self.secondary_buffer = np.roll(self.secondary_buffer, 1)
-        self.secondary_buffer[0] = speaker_out
-        anti_at_ear = np.dot(self.secondary_buffer, self.S_z[:len(self.secondary_buffer)])
+        error_sample = noise_at_ear + anti_at_ear
         
-        # Error = parallel summation
-        error = noise_at_ear + anti_at_ear
-        
-        return ref_out, error
+        return ref_sample, error_sample, noise_at_ear
     
-    def reset_buffers(self):
-        """Reset internal convolution buffers to zero."""
-        self.ref_buffer = np.zeros(len(self.RIR_ref))
-        self.primary_buffer = np.zeros(len(self.P_z))
-        self.secondary_buffer = np.zeros(len(self.S_z))
-    
-    def get_secondary_path_estimate(self) -> np.ndarray:
-        """Get the imperfect secondary path estimate for FxLMS."""
-        return self.S_z_hat.copy()
+    def get_path_info(self) -> dict:
+        """Get information about acoustic paths."""
+        return {
+            "fs": self.fs,
+            "rir_length": self.rir_length,
+            "RIR_ref_energy": np.sum(self.RIR_ref ** 2),
+            "P_z_energy": np.sum(self.P_z ** 2),
+            "S_z_energy": np.sum(self.S_z ** 2),
+            "primary_delay_samples": self.primary_delay_samples,
+            "secondary_delay_samples": self.secondary_delay_samples,
+        }
 

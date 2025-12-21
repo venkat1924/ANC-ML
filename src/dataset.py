@@ -1,28 +1,28 @@
 """
-ANC Dataset: Audio data pipeline with physics-based augmentation.
+DNS Dataset loader for ANC training.
 
-Loads environmental noise recordings and applies augmentations that
-simulate real-world acoustic variations:
-- Gain: Microphone calibration variance
-- Delay: Acoustic path length changes
-- Leakage: Imperfect headphone seal
+Loads audio from Microsoft DNS Challenge noise data and applies
+physics-based augmentation for ANC training.
+
+Key features:
+- Loads .wav files from DNS dataset (or synthetic)
+- Resamples to target sample rate (48kHz)
+- Chunks audio into training segments
+- Applies physics-based augmentation:
+  - Gain variation (mic calibration)
+  - Fractional delay (distance changes)
+  - Leakage filter (imperfect seal)
 """
 
 import os
-import glob
-import random
-from typing import Optional, Tuple, List
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import scipy.signal as signal
-
-try:
-    import torchaudio
-    HAS_TORCHAUDIO = True
-except ImportError:
-    HAS_TORCHAUDIO = False
+from scipy import signal
+from scipy.io import wavfile
+from pathlib import Path
+from typing import Optional, Tuple, List
+import random
 
 try:
     import soundfile as sf
@@ -30,281 +30,341 @@ try:
 except ImportError:
     HAS_SOUNDFILE = False
 
-from .utils import fractional_delay, generate_leakage_tf, db_to_linear
+try:
+    import librosa
+    HAS_LIBROSA = True
+except ImportError:
+    HAS_LIBROSA = False
 
 
-class ANCDataset(Dataset):
+class DNSDataset(Dataset):
     """
-    Dataset for ANC training.
+    Dataset for ANC training using DNS Challenge noise data.
     
-    Loads audio files and applies physics-based augmentations.
-    Returns (input, target) pairs where target is inverted future noise
-    for delay-compensated training.
+    Generates (input, target) pairs where:
+    - input: noise[0:T-K] (current noise)
+    - target: -noise[K:T] (inverted future for cancellation)
+    
+    K is the delay compensation in samples.
     """
     
     def __init__(
         self,
-        root_dir: str,
-        sample_rate: int = 48000,
-        chunk_size: int = 16384,
-        delay_compensation: int = 3,
+        data_dir: str,
+        chunk_length: int = 16384,
+        K: int = 3,
+        fs: int = 48000,
         augment: bool = True,
-        gain_range_db: Tuple[float, float] = (-6.0, 6.0),
-        delay_range_samples: Tuple[float, float] = (-5.0, 5.0),
-        leakage_probability: float = 0.3
+        augment_prob: float = 0.5,
+        max_files: Optional[int] = None,
+        seed: Optional[int] = None
     ):
         """
-        Initialize ANC dataset.
+        Initialize DNS dataset.
         
         Args:
-            root_dir: Directory containing .wav files (searched recursively)
-            sample_rate: Target sample rate (48kHz recommended)
-            chunk_size: Length of audio chunks in samples
-            delay_compensation: K samples to shift target (for latency compensation)
-            augment: Whether to apply augmentations
-            gain_range_db: Random gain range in dB
-            delay_range_samples: Random delay range in samples
-            leakage_probability: Probability of applying leakage TF
+            data_dir: Path to directory containing .wav files
+            chunk_length: Length of audio chunks in samples
+            K: Delay compensation in samples (~60µs at 48kHz)
+            fs: Target sample rate
+            augment: Whether to apply augmentation
+            augment_prob: Probability of applying each augmentation
+            max_files: Maximum number of files to load (for testing)
+            seed: Random seed for reproducibility
         """
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.K = delay_compensation
+        self.data_dir = Path(data_dir)
+        self.chunk_length = chunk_length
+        self.K = K
+        self.fs = fs
         self.augment = augment
-        self.gain_range_db = gain_range_db
-        self.delay_range_samples = delay_range_samples
-        self.leakage_probability = leakage_probability
+        self.augment_prob = augment_prob
+        
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
         
         # Find all audio files
-        self.files = self._find_audio_files(root_dir)
+        self.audio_files = self._find_audio_files(max_files)
         
-        if len(self.files) == 0:
-            print(f"Warning: No audio files found in {root_dir}")
-            print("Dataset will generate synthetic noise for testing.")
-            self.synthetic_mode = True
-        else:
-            self.synthetic_mode = False
-            print(f"Found {len(self.files)} audio files in {root_dir}")
+        if len(self.audio_files) == 0:
+            raise ValueError(f"No audio files found in {data_dir}")
         
-        # Pre-generate leakage transfer functions
-        self.leakage_tfs = {
-            "light": generate_leakage_tf(sample_rate, "light"),
-            "medium": generate_leakage_tf(sample_rate, "medium"),
-            "heavy": generate_leakage_tf(sample_rate, "heavy")
-        }
+        # Build index: (file_idx, chunk_start)
+        self.chunks = self._build_chunk_index()
+        
+        print(f"DNSDataset: {len(self.audio_files)} files, {len(self.chunks)} chunks")
     
-    def _find_audio_files(self, root_dir: str) -> List[str]:
-        """Recursively find all .wav files."""
-        patterns = ["**/*.wav", "**/*.WAV", "**/*.flac", "**/*.mp3"]
+    def _find_audio_files(self, max_files: Optional[int]) -> List[Path]:
+        """Find all .wav files in data directory."""
+        extensions = ['.wav', '.WAV', '.flac', '.FLAC']
         files = []
-        for pattern in patterns:
-            files.extend(glob.glob(os.path.join(root_dir, pattern), recursive=True))
-        return sorted(files)
+        
+        for ext in extensions:
+            files.extend(self.data_dir.rglob(f'*{ext}'))
+        
+        files = sorted(files)
+        
+        if max_files is not None:
+            files = files[:max_files]
+        
+        return files
     
-    def _load_audio(self, path: str) -> Tuple[np.ndarray, int]:
-        """Load audio file and return (audio, sample_rate)."""
-        if HAS_TORCHAUDIO:
-            audio, sr = torchaudio.load(path)
-            audio = audio.numpy()
-        elif HAS_SOUNDFILE:
-            audio, sr = sf.read(path)
-            if audio.ndim == 1:
-                audio = audio[np.newaxis, :]
+    def _build_chunk_index(self) -> List[Tuple[int, int]]:
+        """Build index of (file_idx, chunk_start) tuples."""
+        chunks = []
+        
+        for file_idx, audio_path in enumerate(self.audio_files):
+            try:
+                # Get file duration without loading full audio
+                if HAS_SOUNDFILE:
+                    info = sf.info(audio_path)
+                    n_samples = int(info.frames * self.fs / info.samplerate)
+                else:
+                    # Fallback: load and check
+                    sr, audio = wavfile.read(audio_path)
+                    n_samples = int(len(audio) * self.fs / sr)
+                
+                # Create chunks with 50% overlap
+                stride = self.chunk_length // 2
+                for start in range(0, max(1, n_samples - self.chunk_length), stride):
+                    chunks.append((file_idx, start))
+                    
+            except Exception as e:
+                print(f"Warning: Could not index {audio_path}: {e}")
+        
+        return chunks
+    
+    def _load_audio(self, file_path: Path) -> np.ndarray:
+        """Load and resample audio file."""
+        try:
+            if HAS_LIBROSA:
+                # Librosa handles resampling automatically
+                audio, _ = librosa.load(file_path, sr=self.fs, mono=True)
+            elif HAS_SOUNDFILE:
+                audio, sr = sf.read(file_path, always_2d=False)
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                if sr != self.fs:
+                    # Simple resampling using scipy
+                    n_samples = int(len(audio) * self.fs / sr)
+                    audio = signal.resample(audio, n_samples)
             else:
-                audio = audio.T  # (channels, samples)
-        else:
-            raise RuntimeError("Neither torchaudio nor soundfile available")
-        
-        return audio, sr
-    
-    def _generate_synthetic_noise(self) -> np.ndarray:
-        """Generate synthetic noise for testing when no files available."""
-        t = np.arange(self.chunk_size) / self.sample_rate
-        
-        # Mix of tones and broadband noise (simulates engine + wind)
-        noise = np.zeros(self.chunk_size)
-        
-        # Engine harmonics
-        for freq in [50, 100, 150, 200]:
-            phase = random.uniform(0, 2 * np.pi)
-            amp = random.uniform(0.1, 0.3)
-            noise += amp * np.sin(2 * np.pi * freq * t + phase)
-        
-        # Broadband component
-        noise += 0.2 * np.random.randn(self.chunk_size)
-        
-        # Random low-pass (simulates varying distance)
-        cutoff = random.uniform(500, 2000)
-        nyq = self.sample_rate / 2
-        b, a = signal.butter(2, cutoff / nyq, btype='low')
-        noise = signal.lfilter(b, a, noise)
-        
-        # Normalize
-        noise = noise / (np.max(np.abs(noise)) + 1e-8) * 0.8
-        
-        return noise.astype(np.float32)
+                sr, audio = wavfile.read(file_path)
+                # Convert to float
+                if audio.dtype == np.int16:
+                    audio = audio.astype(np.float32) / 32768.0
+                elif audio.dtype == np.int32:
+                    audio = audio.astype(np.float32) / 2147483648.0
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                if sr != self.fs:
+                    n_samples = int(len(audio) * self.fs / sr)
+                    audio = signal.resample(audio, n_samples)
+            
+            return audio.astype(np.float32)
+            
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            return np.zeros(self.chunk_length, dtype=np.float32)
     
     def _apply_augmentation(self, audio: np.ndarray) -> np.ndarray:
-        """Apply physics-based augmentations."""
+        """
+        Apply physics-based augmentation.
+        
+        Augmentations simulate real-world variations:
+        - Gain: Microphone calibration differences (±6dB)
+        - Delay: Small distance changes (±5 samples)
+        - Leakage: Imperfect headphone seal
+        """
         if not self.augment:
             return audio
         
-        # 1. Random gain (±6dB)
-        gain_db = random.uniform(*self.gain_range_db)
-        audio = audio * db_to_linear(gain_db)
+        # Gain variation (±6dB)
+        if random.random() < self.augment_prob:
+            gain_db = random.uniform(-6, 6)
+            gain_linear = 10 ** (gain_db / 20)
+            audio = audio * gain_linear
         
-        # 2. Random fractional delay (±5 samples)
-        delay = random.uniform(*self.delay_range_samples)
-        if abs(delay) > 0.1:
-            audio = fractional_delay(audio, delay)
+        # Fractional delay (±5 samples)
+        if random.random() < self.augment_prob:
+            delay = random.uniform(-5, 5)
+            audio = self._fractional_delay(audio, delay)
         
-        # 3. Leakage transfer function (30% probability)
-        if random.random() < self.leakage_probability:
-            leak_type = random.choice(["light", "medium", "heavy"])
-            leak_tf = self.leakage_tfs[leak_type]
-            audio = signal.convolve(audio, leak_tf, mode='same')
+        # Leakage filter (30% probability)
+        if random.random() < 0.3:
+            audio = self._apply_leakage(audio)
         
         return audio
     
+    def _fractional_delay(self, sig: np.ndarray, delay: float) -> np.ndarray:
+        """Apply fractional sample delay via sinc interpolation."""
+        if abs(delay) < 0.01:
+            return sig
+        
+        n_taps = 31
+        half_taps = n_taps // 2
+        n = np.arange(n_taps) - half_taps
+        
+        frac = delay - int(delay)
+        kernel = np.sinc(n - frac) * np.hamming(n_taps)
+        kernel /= np.sum(kernel)
+        
+        int_delay = int(delay)
+        if int_delay > 0:
+            sig = np.concatenate([np.zeros(int_delay), sig[:-int_delay]])
+        elif int_delay < 0:
+            sig = np.concatenate([sig[-int_delay:], np.zeros(-int_delay)])
+        
+        return np.convolve(sig, kernel, mode='same')
+    
+    def _apply_leakage(self, audio: np.ndarray) -> np.ndarray:
+        """Apply high-pass leakage filter (imperfect seal simulation)."""
+        cutoff = random.uniform(80, 200)
+        nyq = self.fs / 2
+        
+        b, a = signal.butter(2, cutoff / nyq, btype='high')
+        leaked = signal.lfilter(b, a, audio)
+        
+        # Mix leaked signal with original
+        leak_amount = random.uniform(0.1, 0.3)
+        return audio * (1 - leak_amount) + leaked * leak_amount
+    
     def __len__(self) -> int:
-        if self.synthetic_mode:
-            return 1000  # Virtual dataset size for synthetic mode
-        return len(self.files)
+        return len(self.chunks)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Get training sample.
+        Get a training sample.
         
         Returns:
-            Tuple of (input, target) tensors
-            - input: noise signal (1, T-K)
-            - target: inverted future noise (1, T-K) for cancellation
+            input_tensor: Shape (1, T-K) - current noise
+            target_tensor: Shape (1, T-K) - inverted future noise
         """
-        if self.synthetic_mode:
-            audio = self._generate_synthetic_noise()
-        else:
-            # Load audio file
-            path = self.files[idx % len(self.files)]
-            try:
-                audio, orig_sr = self._load_audio(path)
-                
-                # Convert to mono
-                if audio.shape[0] > 1:
-                    audio = np.mean(audio, axis=0)
-                else:
-                    audio = audio[0]
-                
-                # Resample if needed
-                if orig_sr != self.sample_rate:
-                    num_samples = int(len(audio) * self.sample_rate / orig_sr)
-                    audio = signal.resample(audio, num_samples)
-                
-                # Pad or crop to chunk_size
-                if len(audio) < self.chunk_size:
-                    pad = self.chunk_size - len(audio)
-                    audio = np.pad(audio, (0, pad), mode='constant')
-                elif len(audio) > self.chunk_size:
-                    start = random.randint(0, len(audio) - self.chunk_size)
-                    audio = audio[start:start + self.chunk_size]
-                
-                audio = audio.astype(np.float32)
-                
-            except Exception as e:
-                print(f"Error loading {path}: {e}")
-                audio = self._generate_synthetic_noise()
+        file_idx, chunk_start = self.chunks[idx]
+        audio_path = self.audio_files[file_idx]
         
-        # Normalize to prevent clipping
-        max_val = np.max(np.abs(audio))
-        if max_val > 0:
-            audio = audio / max_val * 0.9
+        # Load audio
+        audio = self._load_audio(audio_path)
         
-        # Apply augmentations
+        # Extract chunk
+        chunk_end = chunk_start + self.chunk_length + self.K
+        if chunk_end > len(audio):
+            # Pad if needed
+            audio = np.pad(audio, (0, chunk_end - len(audio)))
+        
+        audio = audio[chunk_start:chunk_end]
+        
+        # Apply augmentation
         audio = self._apply_augmentation(audio)
         
-        # Create input/target pair with delay compensation
+        # Create input/target pairs with delay compensation
         # Input: noise[0:T-K]
         # Target: -noise[K:T] (inverted future for cancellation)
         K = self.K
-        input_signal = audio[:-K] if K > 0 else audio
-        target_signal = -audio[K:] if K > 0 else -audio
+        if K > 0:
+            input_signal = audio[:-K]
+            target_signal = -audio[K:]  # Inverted for cancellation
+        else:
+            input_signal = audio
+            target_signal = -audio
         
-        # Convert to tensors (1, T-K)
+        # Normalize
+        max_val = max(np.max(np.abs(input_signal)), 1e-8)
+        input_signal = input_signal / max_val
+        target_signal = target_signal / max_val
+        
+        # Convert to tensors with channel dimension
         input_tensor = torch.from_numpy(input_signal).float().unsqueeze(0)
         target_tensor = torch.from_numpy(target_signal).float().unsqueeze(0)
         
         return input_tensor, target_tensor
 
 
-class ANCDatasetStreaming(Dataset):
+class SyntheticNoiseDataset(Dataset):
     """
-    Streaming variant that yields overlapping chunks from long files.
+    Generate synthetic noise for testing without real data.
     
-    More efficient for training on large audio files.
+    Creates various noise types:
+    - Engine harmonics
+    - Broadband (traffic, HVAC)
+    - Wind gusts
+    - Mixed
     """
     
     def __init__(
         self,
-        root_dir: str,
-        sample_rate: int = 48000,
-        chunk_size: int = 16384,
-        hop_size: int = 8192,
-        delay_compensation: int = 3,
-        augment: bool = True
+        n_samples: int = 1000,
+        chunk_length: int = 16384,
+        K: int = 3,
+        fs: int = 48000,
+        seed: Optional[int] = None
     ):
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.hop_size = hop_size
-        self.K = delay_compensation
-        self.augment = augment
+        self.n_samples = n_samples
+        self.chunk_length = chunk_length
+        self.K = K
+        self.fs = fs
         
-        # Load and concatenate all audio
-        files = glob.glob(os.path.join(root_dir, "**/*.wav"), recursive=True)
-        
-        self.audio_data = []
-        for f in files[:100]:  # Limit for memory
-            try:
-                if HAS_TORCHAUDIO:
-                    audio, sr = torchaudio.load(f)
-                    audio = audio.mean(dim=0).numpy()
-                elif HAS_SOUNDFILE:
-                    audio, sr = sf.read(f)
-                    if audio.ndim > 1:
-                        audio = audio.mean(axis=1)
-                else:
-                    continue
-                
-                if sr != sample_rate:
-                    num_samples = int(len(audio) * sample_rate / sr)
-                    audio = signal.resample(audio, num_samples)
-                
-                self.audio_data.append(audio.astype(np.float32))
-            except Exception:
-                continue
-        
-        if self.audio_data:
-            self.audio_data = np.concatenate(self.audio_data)
-            self.n_chunks = (len(self.audio_data) - chunk_size) // hop_size
-        else:
-            self.audio_data = np.random.randn(sample_rate * 60).astype(np.float32)
-            self.n_chunks = (len(self.audio_data) - chunk_size) // hop_size
+        if seed is not None:
+            np.random.seed(seed)
     
     def __len__(self) -> int:
-        return max(1, self.n_chunks)
+        return self.n_samples
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        start = (idx * self.hop_size) % (len(self.audio_data) - self.chunk_size)
-        chunk = self.audio_data[start:start + self.chunk_size].copy()
+        # Generate random noise type
+        noise_type = idx % 5
+        t = np.arange(self.chunk_length + self.K) / self.fs
+        
+        if noise_type == 0:
+            # Engine harmonics
+            audio = self._generate_engine(t)
+        elif noise_type == 1:
+            # Broadband traffic
+            audio = self._generate_broadband(t, cutoff=200)
+        elif noise_type == 2:
+            # Fan/HVAC
+            audio = self._generate_tonal(t, base_freq=120)
+        elif noise_type == 3:
+            # Wind
+            audio = self._generate_broadband(t, cutoff=100) * self._generate_envelope(t)
+        else:
+            # Mixed
+            audio = 0.5 * self._generate_engine(t) + 0.5 * self._generate_broadband(t, 300)
         
         # Normalize
-        max_val = np.max(np.abs(chunk))
-        if max_val > 0:
-            chunk = chunk / max_val * 0.9
+        audio = audio / (np.max(np.abs(audio)) + 1e-8)
         
+        # Create input/target
         K = self.K
-        input_signal = chunk[:-K] if K > 0 else chunk
-        target_signal = -chunk[K:] if K > 0 else -chunk
+        input_signal = audio[:-K] if K > 0 else audio
+        target_signal = -audio[K:] if K > 0 else -audio
         
-        return (
-            torch.from_numpy(input_signal).float().unsqueeze(0),
-            torch.from_numpy(target_signal).float().unsqueeze(0)
-        )
+        input_tensor = torch.from_numpy(input_signal).float().unsqueeze(0)
+        target_tensor = torch.from_numpy(target_signal).float().unsqueeze(0)
+        
+        return input_tensor, target_tensor
+    
+    def _generate_engine(self, t: np.ndarray) -> np.ndarray:
+        base_freq = np.random.uniform(40, 60)
+        audio = np.zeros(len(t))
+        for h in range(1, 7):
+            amp = 0.3 / h
+            phase = np.random.uniform(0, 2 * np.pi)
+            audio += amp * np.sin(2 * np.pi * base_freq * h * t + phase)
+        return audio
+    
+    def _generate_broadband(self, t: np.ndarray, cutoff: float) -> np.ndarray:
+        audio = np.random.randn(len(t))
+        b, a = signal.butter(3, cutoff / (self.fs / 2), btype='low')
+        return signal.filtfilt(b, a, audio)
+    
+    def _generate_tonal(self, t: np.ndarray, base_freq: float) -> np.ndarray:
+        audio = 0.5 * np.sin(2 * np.pi * base_freq * t)
+        audio += 0.25 * np.sin(2 * np.pi * base_freq * 2 * t)
+        audio += np.random.randn(len(t)) * 0.1
+        return audio
+    
+    def _generate_envelope(self, t: np.ndarray) -> np.ndarray:
+        # Wind gust envelope
+        return 1 + 0.5 * np.sin(2 * np.pi * 0.2 * t) * np.sin(2 * np.pi * 0.05 * t)
 
